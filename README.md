@@ -24,6 +24,9 @@
 ```shell
 git clone https://github.com/huangjia2019/rag-project01-framework.git
 ```
+注意：需要退出conda并source虚拟python环境
+conda deactivate
+source /Users/keqin/Documents/workspace/rag_in_action/langchain/bin/activate
 
 然后导航至目录，并按照部署前端或后端的指示开始操作。
 
