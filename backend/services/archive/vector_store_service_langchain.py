@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 class VectorDBProvider(str, Enum):
     """向量数据库提供商枚举类"""
     MILVUS = "milvus"
+    CHROMA = "chroma"
     # ... 其他数据库待添加
 
 class VectorDBConfig:

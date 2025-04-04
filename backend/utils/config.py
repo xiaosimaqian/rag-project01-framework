@@ -3,6 +3,8 @@ from typing import Dict, Any
 
 class VectorDBProvider(str, Enum):
     MILVUS = "milvus"
+    CHROMA = "chroma"
+    OLLAMA = "ollama"
     # More providers can be added later
 
 # 可以在这里添加其他配置相关的内容
@@ -21,6 +23,28 @@ MILVUS_CONFIG = {
         "hnsw": {
             "M": 16,
             "efConstruction": 500
+        }
+    }
+} 
+
+CHROMA_CONFIG = {
+    "uri": "03-vector-store/chroma_db",
+    "settings": {
+        "chroma_db_impl": "duckdb+parquet",
+        "persist_directory": "03-vector-store/chroma_db",
+        "anonymized_telemetry": False
+    },
+    "collection_metadata": {
+        "hnsw:space": "cosine",
+        "hnsw:M": 8,
+        "hnsw:construction_ef": 100,
+        "hnsw:search_ef": 10
+    },
+    "index_params": {
+        "hnsw": {
+            "M": 8,
+            "construction_ef": 100,
+            "search_ef": 10
         }
     }
 } 

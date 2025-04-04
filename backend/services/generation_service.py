@@ -7,13 +7,16 @@ from pathlib import Path
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 from openai import OpenAI
+from langchain_ollama import OllamaLLM
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
 import requests
 
 logger = logging.getLogger(__name__)
 
 class GenerationService:
     """
-    生成服务类：负责调用不同的模型提供商（HuggingFace、OpenAI、DeepSeek）生成回答
+    生成服务类：负责调用不同的模型提供商（HuggingFace、OpenAI、DeepSeek、Ollama）生成回答
     支持本地模型和API调用，并将生成结果保存到文件
     """
     def __init__(self):
@@ -33,7 +36,10 @@ class GenerationService:
             "deepseek": {
                 "deepseek-v3": "deepseek-chat",
                 "deepseek-r1": "deepseek-reasoner",
-            }
+            },
+            "ollama": {
+                "DeepSeek-r1:14b": "DeepSeek-r1:14b",
+            },
         }
         
         # 确保输出目录存在
@@ -217,6 +223,64 @@ class GenerationService:
             logger.error(f"Error generating with DeepSeek: {str(e)}")
             raise
 
+    def _generate_with_ollama(
+        self,
+        model_name: str,
+        query: str,
+        context: str,
+        show_reasoning: bool = True
+    ) -> str:
+        """
+        使用Ollama API生成回答
+        
+        参数:
+            model_name: 模型名称
+            query: 用户查询
+            context: 上下文信息
+            show_reasoning: 是否显示推理过程（仅对推理模型有效）
+            
+        返回:
+            生成的回答文本，对于推理模型可能包含思维过程
+        """
+        try:
+            client = OllamaLLM(
+                model=self.models["ollama"][model_name],
+                base_url="http://localhost:11434"
+            )
+
+            prompt = ChatPromptTemplate.from_messages([
+                    ("system", "You are a helpful assistant. Use the provided context to answer the question."),
+                    ("user", "{input}" )
+            ])
+            output_parser = StrOutputParser()
+            chain = prompt | client | output_parser
+
+            #messages = {"model": "deepseek-r1:14b" , "prompt": f"Context: {context}\n\nQuestion: {query}"}
+            
+ #           response = client.chat.completions.create(
+            response = chain.invoke({"input": f"Context: {context}\n\nQuestion: {query}"})
+            
+            # 如果是推理模型，处理思维链输出
+ #           if response.status_code == 200:
+ #               response_text = response.text
+ #               data = json.loads(response_text)
+ 
+ #               answer = data["response"]
+#                reasoning = message.reasoning_content
+                
+#                if show_reasoning and reasoning:
+#                    return f"【思维过程】\n{reasoning}\n\n【最终答案】\n{answer}"
+#                return answer
+ #           else:
+ #               answer = "no answer"
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"Error generating with Ollama: {str(e)}")
+            raise
+
+
     def generate(
         self,
         provider: str,
@@ -254,6 +318,8 @@ class GenerationService:
                 response = self._generate_with_openai(model_name, query, context, api_key)
             elif provider == "deepseek":
                 response = self._generate_with_deepseek(model_name, query, context, api_key, show_reasoning)
+            elif provider == "ollama":
+                response = self._generate_with_ollama(model_name, query, context,show_reasoning)
             else:
                 raise ValueError(f"Unsupported provider: {provider}")
                 

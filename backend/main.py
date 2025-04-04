@@ -11,11 +11,15 @@ from services.search_service import SearchService
 from services.parsing_service import ParsingService
 import logging
 from enum import Enum
-from utils.config import VectorDBProvider
+from utils.config import VectorDBProvider, MILVUS_CONFIG, CHROMA_CONFIG
 import pandas as pd
 from pathlib import Path
 from services.generation_service import GenerationService
 from typing import List, Dict, Optional
+from fastapi import FastAPI, Body, HTTPException
+from utils.config import VectorDBProvider
+from services.search_service import SearchService
+import logging
 
 # 设置日志
 logging.basicConfig(level=logging.INFO)
@@ -253,7 +257,10 @@ async def index_embeddings(data: dict):
         if not os.path.exists(embedding_file):
             raise FileNotFoundError(f"Embedding file not found: {file_id}")
             
-        config = VectorDBConfig(provider=vector_db, index_mode=index_mode)
+        config = VectorDBConfig(
+            provider=vector_db,
+            index_mode=index_mode
+        )
         vector_store_service = VectorStoreService()
         result = vector_store_service.index_embeddings(embedding_file, config)
         
@@ -285,8 +292,8 @@ async def get_collections(
 ):
     """获取指定向量数据库中的集合"""
     try:
-        search_service = SearchService()
-        collections = search_service.list_collections(provider.value)
+        vector_store_service = VectorStoreService()
+        collections = vector_store_service.list_collections(provider.value)
         return {"collections": collections}
     except Exception as e:
         logger.error(f"Error getting collections: {str(e)}")
@@ -299,14 +306,16 @@ async def get_collections(
 async def search(
     query: str = Body(...),
     collection_id: str = Body(...),
+    provider: str = Body(VectorDBProvider.MILVUS.value),
     top_k: int = Body(3),
     threshold: float = Body(0.7),
-    word_count_threshold: int = Body(100)
+    word_count_threshold: int = Body(100),
+    save_results: bool = Body(False)
 ):
     """执行向量搜索"""
     try:
         # Log the incoming search request details
-        logger.info(f"Search request - Query: {query}, Collection: {collection_id}, Top K: {top_k}, Threshold: {threshold}, Word Count Threshold: {word_count_threshold}")
+        logger.info(f"Search request - Query: {query}, Collection: {collection_id}, Provider: {provider}, Top K: {top_k}, Threshold: {threshold}, Word Count Threshold: {word_count_threshold}")
         
         search_service = SearchService()
         
@@ -316,15 +325,17 @@ async def search(
         results = await search_service.search(
             query=query,
             collection_id=collection_id,
+            provider=provider,
             top_k=top_k,
             threshold=threshold,
-            word_count_threshold=word_count_threshold
+            word_count_threshold=word_count_threshold,
+            save_results=save_results
         )
         
         # Log the search results
         logger.info(f"Search response: {results}")
         
-        return {"results": results}
+        return results
     except Exception as e:
         logger.error(f"Error performing search: {str(e)}")
         raise HTTPException(

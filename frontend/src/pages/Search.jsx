@@ -50,6 +50,7 @@ const Search = () => {
       const searchParams = {
         query,
         collection_id: collection,
+        provider: selectedProvider,  // 添加这一行
         top_k: topK,
         threshold,
         word_count_threshold: wordCountThreshold,
@@ -73,8 +74,8 @@ const Search = () => {
       const data = await response.json();
       console.log('搜索响应:', data);
 
-      if (data.results && data.results.results && data.results.results.length > 0) {
-        setResults(data.results.results);
+      if (data.results && data.results.length > 0) {
+        setResults(data.results);
         if (saveResults && data.saved_filepath) {
           setStatus(`搜索完成！结果已保存至: ${data.saved_filepath}`);
         } else {

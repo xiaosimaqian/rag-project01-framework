@@ -6,7 +6,8 @@ import logging
 from pathlib import Path
 from pymilvus import connections, utility
 from pymilvus import Collection, DataType, FieldSchema, CollectionSchema
-from utils.config import VectorDBProvider, MILVUS_CONFIG  # Updated import
+from utils.config import VectorDBProvider, MILVUS_CONFIG, CHROMA_CONFIG # Updated import
+from services.chroma_service import ChromaService
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +25,12 @@ class VectorDBConfig:
         """
         self.provider = provider
         self.index_mode = index_mode
-        self.milvus_uri = MILVUS_CONFIG["uri"]
+        if provider == VectorDBProvider.MILVUS.value:
+            self.uri = MILVUS_CONFIG["uri"]
+        elif provider == VectorDBProvider.CHROMA.value:
+            self.uri = CHROMA_CONFIG["uri"]
+            self.collection_metadata = CHROMA_CONFIG["collection_metadata"]
+            self.index_params = CHROMA_CONFIG["index_params"].get(index_mode, {})
 
     def _get_milvus_index_type(self, index_mode: str) -> str:
         """
@@ -50,6 +56,7 @@ class VectorDBConfig:
         """
         return MILVUS_CONFIG["index_params"].get(index_mode, {})
 
+
 class VectorStoreService:
     """
     向量存储服务类，提供向量数据的索引、查询和管理功能
@@ -59,6 +66,7 @@ class VectorStoreService:
         初始化向量存储服务
         """
         self.initialized_dbs = {}
+        self.chroma_service = None  # 延迟初始化
         # 确保存储目录存在
         os.makedirs("03-vector-store", exist_ok=True)
     
@@ -85,6 +93,13 @@ class VectorStoreService:
             Milvus索引参数字典
         """
         return config._get_milvus_index_params(config.index_mode)
+
+    def _init_chroma_service(self, config: VectorDBConfig):
+        """
+        初始化 ChromaService，传入配置
+        """
+        if self.chroma_service is None:
+            self.chroma_service = ChromaService(config)
     
     def index_embeddings(self, embedding_file: str, config: VectorDBConfig) -> Dict[str, Any]:
         """
@@ -103,8 +118,13 @@ class VectorStoreService:
         embeddings_data = self._load_embeddings(embedding_file)
         
         # 根据不同的数据库进行索引
-        if config.provider == VectorDBProvider.MILVUS:
+        if config.provider == VectorDBProvider.MILVUS.value:
             result = self._index_to_milvus(embeddings_data, config)
+        elif config.provider == VectorDBProvider.CHROMA.value:
+            self._init_chroma_service(config)  # 确保 ChromaService 已初始化
+            result = self.chroma_service.index_embeddings(embeddings_data, config.index_mode)
+        else:
+            raise ValueError(f"Unsupported vector database provider: {config.provider}")
         
         end_time = datetime.now()
         processing_time = (end_time - start_time).total_seconds()
@@ -117,7 +137,7 @@ class VectorStoreService:
             "processing_time": processing_time,
             "collection_name": result.get("collection_name", "N/A")
         }
-    
+        
     def _load_embeddings(self, file_path: str) -> Dict[str, Any]:
         """
         加载embedding文件，返回配置信息和embeddings
@@ -284,65 +304,117 @@ class VectorStoreService:
         finally:
             connections.disconnect("default")
 
-    def list_collections(self, provider: str) -> List[str]:
+    def list_collections(self, provider: str) -> List[Dict[str, Any]]:
         """
         列出指定提供商的所有集合
         
         参数:
-            provider: 向量数据库提供商
+            provider: 向量数据库提供商名称
             
         返回:
-            集合名称列表
+            集合信息列表
         """
-        if provider == VectorDBProvider.MILVUS:
-            try:
-                connections.connect(alias="default", uri=MILVUS_CONFIG["uri"])
-                collections = utility.list_collections()
-                return collections
-            finally:
-                connections.disconnect("default")
-        return []
+        try:
+            if provider == VectorDBProvider.CHROMA.value:
+                self._init_chroma_service(None)
+                return self.chroma_service.list_collections()
+            elif provider == VectorDBProvider.MILVUS.value:
+                # 连接到 Milvus
+                connections.connect(
+                    alias="default",
+                    uri=MILVUS_CONFIG["uri"]
+                )
+                try:
+                    collections = []
+                    collection_names = utility.list_collections()
+                    
+                    for name in collection_names:
+                        try:
+                            collection = Collection(name)
+                            collections.append({
+                                "id": name,
+                                "name": name,
+                                "count": collection.num_entities
+                            })
+                        except Exception as e:
+                            logger.error(f"Error getting info for collection {name}: {str(e)}")
+                    
+                    return collections
+                finally:
+                    connections.disconnect("default")
+            else:
+                raise ValueError(f"Unsupported vector database provider: {provider}")
+                
+        except Exception as e:
+            logger.error(f"Error listing collections: {str(e)}")
+            raise
+
+    def get_collection_info(self, provider: str, collection_name: str) -> Dict[str, Any]:
+        """
+        获取指定集合的详细信息
+        
+        参数:
+            provider: 向量数据库提供商名称
+            collection_name: 集合名称
+            
+        返回:
+            集合详细信息
+        """
+        try:
+            if provider == VectorDBProvider.CHROMA.value:
+                self._init_chroma_service()
+                return self.chroma_service.get_collection_info(collection_name)
+            elif provider == VectorDBProvider.MILVUS.value:
+                # 连接到 Milvus
+                connections.connect(
+                    alias="default",
+                    uri=MILVUS_CONFIG["uri"]
+                )
+                try:
+                    collection = Collection(collection_name)
+                    return {
+                        "name": collection_name,
+                        "num_entities": collection.num_entities,
+                        "schema": collection.schema
+                    }
+                finally:
+                    connections.disconnect("default")
+            else:
+                raise ValueError(f"Unsupported vector database provider: {provider}")
+                
+        except Exception as e:
+            logger.error(f"Error getting collection info: {str(e)}")
+            raise
 
     def delete_collection(self, provider: str, collection_name: str) -> bool:
         """
         删除指定的集合
         
         参数:
-            provider: 向量数据库提供商
+            provider: 向量数据库提供商名称
             collection_name: 集合名称
             
         返回:
             是否删除成功
         """
-        if provider == VectorDBProvider.MILVUS:
-            try:
-                connections.connect(alias="default", uri=MILVUS_CONFIG["uri"])
-                utility.drop_collection(collection_name)
-                return True
-            finally:
-                connections.disconnect("default")
-        return False
-
-    def get_collection_info(self, provider: str, collection_name: str) -> Dict[str, Any]:
-        """
-        获取指定集合的信息
-        
-        参数:
-            provider: 向量数据库提供商
-            collection_name: 集合名称
-            
-        返回:
-            集合信息字典
-        """
-        if provider == VectorDBProvider.MILVUS:
-            try:
-                connections.connect(alias="default", uri=MILVUS_CONFIG["uri"])
-                collection = Collection(collection_name)
-                return {
-                    "name": collection_name,
-                    "num_entities": collection.num_entities,
-                    "schema": collection.schema.to_dict()
-                }
-            finally:
-                connections.disconnect("default")
-        return {}
+        try:
+            if provider == VectorDBProvider.CHROMA.value:
+                self._init_chroma_service()
+                return self.chroma_service.delete_collection(collection_name)
+            elif provider == VectorDBProvider.MILVUS.value:
+                # 连接到 Milvus
+                connections.connect(
+                    alias="default",
+                    uri=MILVUS_CONFIG["uri"]
+                )
+                try:
+                    utility.drop_collection(collection_name)
+                    return True
+                finally:
+                    connections.disconnect("default")
+            else:
+                raise ValueError(f"Unsupported vector database provider: {provider}")
+                
+        except Exception as e:
+            logger.error(f"Error deleting collection: {str(e)}")
+            return False

@@ -26,6 +26,9 @@ const EmbeddingFile = () => {
       { value: 'sentence-transformers/all-mpnet-base-v2', label: 'all-mpnet-base-v2' },
       { value: 'all-MiniLM-L6-v2', label: 'all-MiniLM-L6-v2' },
       { value: 'google-bert/bert-base-uncased', label: 'bert-base-uncased' }
+    ],
+    ollama: [
+      { value: 'bge-m3:latest', label: 'bge-m3:latest'},
     ]
   };
 
@@ -301,6 +304,7 @@ const EmbeddingFile = () => {
                 <option value="openai">OpenAI</option>
                 <option value="bedrock">Bedrock</option>
                 <option value="huggingface">HuggingFace</option>
+                <option value="ollama">Ollama</option>
               </select>
             </div>
 

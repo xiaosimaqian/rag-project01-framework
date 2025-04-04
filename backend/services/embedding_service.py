@@ -6,6 +6,8 @@ from datetime import datetime
 from enum import Enum
 import boto3
 from langchain_community.embeddings import BedrockEmbeddings, OpenAIEmbeddings, HuggingFaceEmbeddings
+from langchain_ollama import OllamaEmbeddings
+from langchain_ollama import OllamaLLM
 
 class EmbeddingProvider(str, Enum):
     """
@@ -14,6 +16,7 @@ class EmbeddingProvider(str, Enum):
     OPENAI = "openai"
     BEDROCK = "bedrock"
     HUGGINGFACE = "huggingface"
+    OLLAMA = "ollama"
 
 class EmbeddingConfig:
     """
@@ -275,6 +278,12 @@ class EmbeddingFactory:
         elif config.provider == EmbeddingProvider.HUGGINGFACE:
             return HuggingFaceEmbeddings(
                 model_name=config.model_name
+            )
+        
+        elif config.provider == EmbeddingProvider.OLLAMA:
+            return OllamaEmbeddings(
+                model="bge-m3:latest", 
+                base_url="http://localhost:11434"
             )
             
         raise ValueError(f"Unsupported embedding provider: {config.provider}")
