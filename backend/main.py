@@ -20,6 +20,7 @@ from fastapi import FastAPI, Body, HTTPException
 from utils.config import VectorDBProvider
 from services.search_service import SearchService
 import logging
+from pymilvus import connections
 
 # 设置日志
 logging.basicConfig(level=logging.INFO)
@@ -41,6 +42,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info("Starting up the application...")
+    # 可以在这里添加 Milvus 连接初始化
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("Shutting down the application...")
+    try:
+        # 确保所有 Milvus 连接都被正确关闭
+        for alias in connections.list_connections():
+            connections.disconnect(alias)
+            logger.info(f"Disconnected Milvus connection: {alias}")
+    except Exception as e:
+        logger.error(f"Error during shutdown: {str(e)}")
 
 @app.post("/process")
 async def process_file(

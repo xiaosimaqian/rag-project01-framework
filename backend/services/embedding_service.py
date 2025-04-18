@@ -125,67 +125,37 @@ class EmbeddingService:
     def save_embeddings(self, doc_name: str, embeddings: list) -> str:
         """
         保存嵌入向量到JSON文件
-        
-        参数:
-            doc_name: 文档名称
-            embeddings: 嵌入向量列表
-            
-        返回:
-            保存的文件路径
         """
-        os.makedirs("02-embedded-docs", exist_ok=True)
+        # 修改保存路径
+        save_dir = os.path.join("backend", "02-embedded-docs")
+        os.makedirs(save_dir, exist_ok=True)
         
-        # 获取第一个embedding的元数据
+        # 获取第一个embedding的信息
         first_embedding = embeddings[0]
-        provider = first_embedding["metadata"]["embedding_provider"]
+        provider = first_embedding["embedding_provider"]
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
         
-        # 保持原始文件名（包括扩展名）
+        # 构建文件名
         base_name = doc_name.split('_')[0]
         if not base_name.endswith('.pdf'):
             base_name += '.pdf'
         
-        # 构建新的文件名：基础名称_provider_时间戳
         filename = f"{base_name.replace('.pdf', '')}_{provider}_{timestamp}.json"
-        filepath = os.path.join("02-embedded-docs", filename)
+        filepath = os.path.join(save_dir, filename)
         
-        # 从第一个embedding中获取配置信息
-        config_info = {
-            "filename": base_name,  # 使用完整的文件名（包括.pdf）
-            "chunked_doc_name": doc_name,  # Add chunked_doc_name
+        # 构建输出数据结构
+        output_data = {
+            "filename": base_name,
+            "chunked_doc_name": doc_name,
             "created_at": datetime.now().isoformat(),
             "embedding_provider": provider,
-            "embedding_model": first_embedding["metadata"]["embedding_model"],
-            "vector_dimension": first_embedding["metadata"]["vector_dimension"]
+            "embedding_model": first_embedding["embedding_model"],
+            "vector_dimension": len(first_embedding["embedding"]),
+            "embeddings": embeddings
         }
         
-        class CompactJSONEncoder(json.JSONEncoder):
-            """自定义JSON编码器，用于优化嵌入向量的存储格式"""
-            def default(self, obj):
-                if isinstance(obj, datetime):
-                    return obj.isoformat()
-                return super().default(obj)
-            
-            def encode(self, obj):
-                # 将 embedding 数组转换为单行，其他保持格式化
-                def format_list(lst):
-                    if isinstance(lst, list):
-                        # 检查是否为 embedding 数组（通过检查第一个元素是否为数字）
-                        if lst and isinstance(lst[0], (int, float)):
-                            return '[' + ','.join(map(str, lst)) + ']'
-                        return [format_list(item) for item in lst]
-                    elif isinstance(lst, dict):
-                        return {k: format_list(v) for k, v in lst.items()}
-                    return lst
-                
-                return super().encode(format_list(obj))
-        
-        # 保存数据，配置信息放在顶层
         with open(filepath, "w", encoding="utf-8") as f:
-            json.dump({
-                **config_info,  # 配置信息放在顶层
-                "embeddings": embeddings
-            }, f, ensure_ascii=False, indent=2, cls=CompactJSONEncoder)
+            json.dump(output_data, f, ensure_ascii=False, indent=2, cls=CompactJSONEncoder)
             
         return filepath
 
