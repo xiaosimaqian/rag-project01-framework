@@ -125,17 +125,18 @@ const Indexing = () => {
         throw new Error(data.detail || `索引失败，状态码: ${response.status}`);
       }
 
-      setIndexingResult(data);
+      setIndexingResult({
+        database: data.details.database,
+        collection_name: data.details.collection_name,
+        index_mode: data.details.index_mode,
+        action: data.details.action,
+        total_vectors: data.details.total_vectors,
+        total_entities: data.details.total_entities,
+        processing_time: data.details.processing_time,
+        index_size: data.details.index_size
+      });
       
-      const statusMessage = [
-        `索引完成：${data.collection_name || 'N/A'}`,
-        `模式：${data.index_mode || 'N/A'}`,
-        `处理向量数：${data.total_vectors || 0}`,
-        `处理时间：${data.processing_time ? data.processing_time.toFixed(2) + 's' : 'N/A'}`,
-        `索引大小：${data.index_size || 'N/A'}`
-      ].join(' | ');
-      
-      setStatus(statusMessage);
+      setStatus(data.message);
 
       if (indexAction === 'create' || indexAction === 'append') {
         fetchCollections(selectedProvider);
@@ -149,31 +150,35 @@ const Indexing = () => {
 
   const handleDisplay = async (collectionName) => {
     if (!collectionName) return;
-    setStatus(`Fetching details for ${collectionName}...`);
+    setStatus(`正在获取集合 "${collectionName}" 的信息...`);
     setIndexingResult(null);
 
     try {
-      const response = await fetch(`${apiBaseUrl}/collections/${selectedProvider}/${collectionName}`);
-       if (!response.ok) {
-         const errorData = await response.json();
-         throw new Error(errorData.detail || `Failed to fetch details: ${response.status}`);
-      }
-      const data = await response.json();
+        const response = await fetch(`${apiBaseUrl}/collections/${selectedProvider}/${collectionName}`);
+        if (!response.ok) {
+            const errorData = await response.json();
+            throw new Error(errorData.detail || `获取集合信息失败: ${response.status}`);
+        }
+        const data = await response.json();
 
-      const displayData = {
-        database: selectedProvider,
-        collection_name: data.name,
-        total_vectors: data.num_entities,
-        schema: data.schema,
-        indexes: data.indexes,
-        description: data.description
-      };
-      setIndexingResult(displayData);
-      setStatus(`Details for collection: ${data.name}`);
+        // 构造显示数据，使用默认值防止未定义错误
+        const displayData = {
+            database: selectedProvider,
+            collection_name: data.name || collectionName,
+            total_vectors: data.num_entities || 0,
+            schema: data.schema || {},
+            index_type: data.index_type || 'N/A',
+            index_params: data.index_params || {},
+            metric_type: data.metric_type || 'N/A',
+            description: data.description || `集合 ${collectionName} 的信息`
+        };
+        
+        setIndexingResult(displayData);
+        setStatus(`集合信息已加载: ${displayData.collection_name}`);
     } catch (error) {
-      console.error('Error displaying collection:', error);
-      setStatus(`Error displaying collection: ${error.message}`);
-      setIndexingResult(null);
+        console.error('获取集合信息错误:', error);
+        setStatus(`获取集合信息失败: ${error.message}`);
+        setIndexingResult(null);
     }
   };
 
@@ -358,30 +363,142 @@ const Indexing = () => {
         <div className="md:col-span-8 lg:col-span-9 border rounded-lg bg-white shadow-lg min-h-[400px] flex items-center justify-center">
           {indexingResult ? (
             <div className="p-6 w-full">
-              <h3 className="text-xl font-semibold mb-4 text-gray-800">
-                索引结果
-              </h3>
-              <div className="space-y-3 text-sm text-gray-700 bg-gray-50 p-4 rounded border border-gray-200 max-w-full overflow-x-auto">
-                <p><strong>数据库：</strong> {indexingResult.database}</p>
-                <p><strong>集合名称：</strong> {indexingResult.collection_name}</p>
-                <p><strong>索引模式：</strong> {indexingResult.index_mode}</p>
-                <p><strong>向量总数：</strong> {indexingResult.total_vectors}</p>
-                <p><strong>处理时间：</strong> {indexingResult.processing_time ? `${indexingResult.processing_time.toFixed(2)}秒` : 'N/A'}</p>
-                <p><strong>索引大小：</strong> {indexingResult.index_size}</p>
-                {indexingResult.schema && (
-                  <div>
-                    <strong>集合结构：</strong>
-                    <pre className="bg-gray-100 p-2 rounded mt-1 text-xs overflow-auto">
-                      {typeof indexingResult.schema === 'string' 
-                        ? indexingResult.schema 
-                        : JSON.stringify(indexingResult.schema, null, 2)}
-                    </pre>
-                  </div>
-                )}
-              </div>
+                <h3 className="text-xl font-semibold mb-4 text-gray-800 border-b pb-2">
+                    集合详细信息
+                </h3>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    {/* 基本信息 */}
+                    <div className="bg-white p-4 rounded-lg border border-gray-200 shadow-sm">
+                        <h4 className="font-semibold text-lg mb-3 text-indigo-600">基本信息</h4>
+                        <div className="space-y-2">
+                            <div className="flex justify-between">
+                                <span className="text-gray-600">数据库类型</span>
+                                <span className="font-medium">{indexingResult.database || 'N/A'}</span>
+                            </div>
+                            <div className="flex justify-between">
+                                <span className="text-gray-600">集合名称</span>
+                                <span className="font-medium">{indexingResult.collection_name || 'N/A'}</span>
+                            </div>
+                            <div className="flex justify-between">
+                                <span className="text-gray-600">向量总数</span>
+                                <span className="font-medium">{indexingResult.total_vectors?.toLocaleString() || 0}</span>
+                            </div>
+                            <div className="flex justify-between">
+                                <span className="text-gray-600">创建时间</span>
+                                <span className="font-medium">
+                                    {indexingResult.creation_time ? 
+                                        new Date(indexingResult.creation_time).toLocaleString() : 'N/A'}
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* 索引信息 */}
+                    <div className="bg-white p-4 rounded-lg border border-gray-200 shadow-sm">
+                        <h4 className="font-semibold text-lg mb-3 text-indigo-600">索引配置</h4>
+                        <div className="space-y-2">
+                            <div className="flex justify-between">
+                                <span className="text-gray-600">索引类型</span>
+                                <span className="font-medium">{indexingResult.index_type || 'N/A'}</span>
+                            </div>
+                            <div className="flex justify-between">
+                                <span className="text-gray-600">度量类型</span>
+                                <span className="font-medium">{indexingResult.metric_type || 'N/A'}</span>
+                            </div>
+                            {Object.keys(indexingResult.index_params || {}).length > 0 && (
+                                <div className="mt-3">
+                                    <span className="text-gray-600 block mb-1">索引参数</span>
+                                    <div className="bg-gray-50 p-2 rounded text-sm font-mono overflow-x-auto">
+                                        <pre className="whitespace-pre-wrap">
+                                            {JSON.stringify(indexingResult.index_params, null, 2)}
+                                        </pre>
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+
+                    {/* Schema 信息 */}
+                    {indexingResult.schema && indexingResult.schema.fields && (
+                        <div className="col-span-1 md:col-span-2 bg-white p-4 rounded-lg border border-gray-200 shadow-sm">
+                            <h4 className="font-semibold text-lg mb-3 text-indigo-600">集合结构 (Schema)</h4>
+                            <div className="overflow-x-auto">
+                                <table className="min-w-full divide-y divide-gray-200">
+                                    <thead className="bg-gray-50">
+                                        <tr>
+                                            <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">字段名</th>
+                                            <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">类型</th>
+                                            <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">说明</th>
+                                            <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">属性</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody className="bg-white divide-y divide-gray-200">
+                                        {indexingResult.schema.fields.map((field, index) => (
+                                            <tr key={index} className={index % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
+                                                <td className="px-4 py-2 text-sm font-medium text-gray-900">
+                                                    {field.name}
+                                                    {field.is_primary && (
+                                                        <span className="ml-2 inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-yellow-100 text-yellow-800">
+                                                            主键
+                                                        </span>
+                                                    )}
+                                                </td>
+                                                <td className="px-4 py-2 text-sm text-gray-500">
+                                                    <div className="flex flex-col">
+                                                        <span>{field.type_description}</span>
+                                                        <span className="text-xs text-gray-400">({field.dtype})</span>
+                                                    </div>
+                                                </td>
+                                                <td className="px-4 py-2 text-sm text-gray-500">
+                                                    {field.description || '-'}
+                                                </td>
+                                                <td className="px-4 py-2 text-sm text-gray-500">
+                                                    <div className="space-y-1">
+                                                        {field.is_primary && (
+                                                            <div className="text-xs">
+                                                                <span className="font-medium">主键</span>
+                                                            </div>
+                                                        )}
+                                                        {field.auto_id && (
+                                                            <div className="text-xs">
+                                                                <span className="font-medium">自动生成ID</span>
+                                                            </div>
+                                                        )}
+                                                        {field.max_length && (
+                                                            <div className="text-xs">
+                                                                <span className="font-medium">最大长度：</span>
+                                                                {field.max_length}
+                                                            </div>
+                                                        )}
+                                                        {field.dimension && (
+                                                            <div className="text-xs">
+                                                                <span className="font-medium">向量维度：</span>
+                                                                {field.dimension}
+                                                            </div>
+                                                        )}
+                                                        {field.params && Object.keys(field.params).length > 0 && (
+                                                            <details className="cursor-pointer text-xs">
+                                                                <summary className="text-indigo-600 hover:text-indigo-700">
+                                                                    更多参数
+                                                                </summary>
+                                                                <pre className="mt-2 text-xs bg-gray-50 p-2 rounded overflow-x-auto">
+                                                                    {JSON.stringify(field.params, null, 2)}
+                                                                </pre>
+                                                            </details>
+                                                        )}
+                                                    </div>
+                                                </td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    )}
+                </div>
             </div>
           ) : (
-            <RandomImage message="索引结果将在这里显示" />
+            <RandomImage message="集合信息将在这里显示" />
           )}
         </div>
       </div>

@@ -5,9 +5,26 @@ import json
 from datetime import datetime
 from enum import Enum
 import boto3
+import numpy as np  # 添加这个导入
 from langchain_community.embeddings import BedrockEmbeddings, OpenAIEmbeddings, HuggingFaceEmbeddings
 from langchain_ollama import OllamaEmbeddings
 from langchain_ollama import OllamaLLM
+
+# 添加 CompactJSONEncoder 类定义
+class CompactJSONEncoder(json.JSONEncoder):
+    """
+    自定义 JSON 编码器，用于处理 NumPy 数组和其他特殊类型的序列化
+    """
+    def default(self, obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        return super().default(obj)
 
 class EmbeddingProvider(str, Enum):
     """
@@ -125,6 +142,13 @@ class EmbeddingService:
     def save_embeddings(self, doc_name: str, embeddings: list) -> str:
         """
         保存嵌入向量到JSON文件
+        
+        参数:
+            doc_name: 文档名称
+            embeddings: 嵌入向量列表，每个元素包含 embedding 和 metadata
+            
+        返回:
+            保存的文件路径
         """
         # 修改保存路径
         save_dir = os.path.join("backend", "02-embedded-docs")
@@ -132,7 +156,7 @@ class EmbeddingService:
         
         # 获取第一个embedding的信息
         first_embedding = embeddings[0]
-        provider = first_embedding["embedding_provider"]
+        provider = first_embedding["metadata"]["embedding_provider"]  # 从 metadata 中获取
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
         
         # 构建文件名
@@ -149,7 +173,7 @@ class EmbeddingService:
             "chunked_doc_name": doc_name,
             "created_at": datetime.now().isoformat(),
             "embedding_provider": provider,
-            "embedding_model": first_embedding["embedding_model"],
+            "embedding_model": first_embedding["metadata"]["embedding_model"],  # 从 metadata 中获取
             "vector_dimension": len(first_embedding["embedding"]),
             "embeddings": embeddings
         }

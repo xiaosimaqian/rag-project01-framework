@@ -224,7 +224,8 @@ async def list_embedded_docs():
     """List all embedded documents"""
     try:
         documents = []
-        embedded_dir = "02-embedded-docs"
+        # 修改目录路径以匹配 save_embeddings 中的路径
+        embedded_dir = os.path.join("backend", "02-embedded-docs")
         logger.info(f"Scanning directory: {embedded_dir}")
         
         if not os.path.exists(embedded_dir):
@@ -242,7 +243,7 @@ async def list_embedded_docs():
                         doc_info = {
                             "name": filename,  # 保持原始文件名
                             "metadata": {
-                                "document_name": data.get("document_name", filename),
+                                "document_name": data.get("filename", filename),
                                 "embedding_model": data.get("embedding_model", ""),
                                 "embedding_provider": data.get("embedding_provider", ""),
                                 "embedding_timestamp": data.get("created_at", ""),
@@ -266,24 +267,62 @@ async def index_embeddings(data: dict):
         file_id = data.get("fileId")
         vector_db = data.get("vectorDb")
         index_mode = data.get("indexMode")
-        
+
         if not all([file_id, vector_db, index_mode]):
             raise ValueError("Missing required fields")
-            
-        embedding_file = os.path.join("02-embedded-docs", file_id)
+
+        # --- 修改路径 ---
+        # 确保使用相对于 backend 目录的正确路径
+        embedding_file = os.path.join("backend", "02-embedded-docs", file_id)
+        logger.info(f"Attempting to index file at path: {embedding_file}") # 添加日志记录
+        # --- 结束修改 ---
+
         if not os.path.exists(embedding_file):
-            raise FileNotFoundError(f"Embedding file not found: {file_id}")
-            
+            logger.error(f"File not found at path: {embedding_file}") # 添加错误日志
+            # 可能需要检查 file_id 是否包含 .json 后缀
+            if not file_id.endswith('.json'):
+                 logger.warning(f"Provided fileId '{file_id}' does not end with .json. Trying with .json appended.")
+                 embedding_file_json = embedding_file + '.json'
+                 if os.path.exists(embedding_file_json):
+                      embedding_file = embedding_file_json
+                      logger.info(f"Found file by appending .json: {embedding_file}")
+                 else:
+                      raise FileNotFoundError(f"Embedding file not found: {file_id} (or {file_id}.json)")
+            else:
+                 raise FileNotFoundError(f"Embedding file not found: {file_id}")
+
+
         config = VectorDBConfig(
             provider=vector_db,
             index_mode=index_mode
         )
         vector_store_service = VectorStoreService()
-        result = vector_store_service.index_embeddings(embedding_file, config)
-        
-        return result
+        # --- 传递正确的路径给服务 ---
+        # index_embeddings 内部的 _load_embeddings 也需要正确的路径
+        result_details = vector_store_service.index_embeddings(embedding_file, config)
+        # --- 结束传递 ---
+
+        # 构造包含 message 的响应 (根据之前的修改)
+        success_message = (
+            f"Indexing completed successfully for collection '{result_details.get('collection_name', 'N/A')}'. "
+            f"Processed {result_details.get('total_vectors', 'N/A')} vectors. "
+            f"Time: {result_details.get('processing_time', 'N/A'):.2f}s. "
+            f"Index Size Info: {result_details.get('index_size', 'N/A')}."
+        )
+        logger.info(success_message) # Log the detailed message
+
+        return {
+            "message": success_message,
+            "details": result_details # Optionally keep details if frontend needs them
+        }
+    except FileNotFoundError as fnf_error: # Catch FileNotFoundError specifically
+        logger.error(f"Error during indexing - File Not Found: {fnf_error}", exc_info=True)
+        raise HTTPException(
+            status_code=404, # Use 404 for File Not Found
+            detail=str(fnf_error)
+        )
     except Exception as e:
-        logger.error(f"Error during indexing: {str(e)}")
+        logger.error(f"Error during indexing: {str(e)}", exc_info=True) # Add exc_info for full traceback
         raise HTTPException(
             status_code=500,
             detail=str(e)
