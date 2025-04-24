@@ -522,14 +522,30 @@ async def get_documents(type: str = Query("all")):
                             doc_data = json.load(f)
                             documents.append({
                                 "id": filename,
-                                "name": filename,  # 保持原始文件名
+                                "name": filename,
                                 "type": "chunked"
+                            })
+
+        # 读取parsed文档
+        if type in ["all", "parsed"]:
+            parsed_dir = "01-parsed-docs"
+            if os.path.exists(parsed_dir):
+                for filename in os.listdir(parsed_dir):
+                    if filename.endswith('.json'):
+                        file_path = os.path.join(parsed_dir, filename)
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            doc_data = json.load(f)
+                            documents.append({
+                                "id": filename,
+                                "name": filename,
+                                "type": "parsed",
+                                "metadata": doc_data.get("metadata", {})
                             })
         
         return {"documents": documents}
     except Exception as e:
         logger.error(f"Error getting documents: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise
 
 @app.get("/documents/{doc_name}")
 async def get_document(doc_name: str, type: str = Query("loaded")):
@@ -686,10 +702,26 @@ async def parse_file(
             page_map=page_map
         )
         
+        # 保存解析结果到 01-chunked-docs 目录，添加 parsed_ 前缀
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        base_name = os.path.splitext(file.filename)[0]
+        doc_name = f"parsed_{base_name}_{timestamp}"
+        
+        # 创建保存目录
+        os.makedirs("01-chunked-docs", exist_ok=True)
+        
+        # 保存文件
+        filepath = os.path.join("01-chunked-docs", f"{doc_name}.json")
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(parsed_content, f, ensure_ascii=False, indent=2)
+        
         # Clean up temp file
         os.remove(temp_path)
         
-        return {"parsed_content": parsed_content}
+        return {
+            "parsed_content": parsed_content,
+            "saved_filepath": filepath
+        }
     except Exception as e:
         logger.error(f"Error parsing file: {str(e)}")
         raise
@@ -784,6 +816,7 @@ async def chunk_document(data: dict = Body(...)):
         doc_id = data.get("doc_id")
         chunking_option = data.get("chunking_option")
         chunk_size = data.get("chunk_size", 1000)
+        doc_type = data.get("doc_type", "loaded")  # 添加文档类型参数
         
         if not doc_id or not chunking_option:
             raise HTTPException(
@@ -791,8 +824,10 @@ async def chunk_document(data: dict = Body(...)):
                 detail="Missing required parameters: doc_id and chunking_option"
             )
         
-        # 读取已加载的文档
-        file_path = os.path.join("01-loaded-docs", doc_id)
+        # 根据文档类型选择目录
+        directory = "01-loaded-docs" if doc_type == "loaded" else "01-parsed-docs"
+        file_path = os.path.join(directory, doc_id)
+        
         if not os.path.exists(file_path):
             raise HTTPException(status_code=404, detail="Document not found")
             
@@ -800,19 +835,29 @@ async def chunk_document(data: dict = Body(...)):
             doc_data = json.load(f)
             
         # 构建页面映射
-        page_map = [
-            {
-                'page': chunk['metadata']['page_number'],
-                'text': chunk['content']
-            }
-            for chunk in doc_data['chunks']
-        ]
+        page_map = []
+        if doc_type == "loaded":
+            page_map = [
+                {
+                    'page': chunk['metadata']['page_number'],
+                    'text': chunk['content']
+                }
+                for chunk in doc_data['chunks']
+            ]
+        else:  # parsed
+            page_map = [
+                {
+                    'page': item['page'],
+                    'text': item['content']
+                }
+                for item in doc_data['content']
+            ]
             
         # 准备元数据
         metadata = {
-            "filename": doc_data['filename'],
-            "loading_method": doc_data['loading_method'],
-            "total_pages": doc_data['total_pages']
+            "filename": doc_data.get('filename', doc_id),
+            "loading_method": doc_data.get('loading_method', 'parsed'),
+            "total_pages": doc_data.get('total_pages', len(page_map))
         }
             
         chunking_service = ChunkingService()
@@ -826,7 +871,7 @@ async def chunk_document(data: dict = Body(...)):
         
         # 生成输出文件名
         timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
-        base_name = doc_data['filename'].replace('.pdf', '').split('_')[0]
+        base_name = os.path.splitext(doc_id)[0].split('_')[0]
         output_filename = f"{base_name}_{chunking_option}_{timestamp}.json"
         
         output_path = os.path.join("01-chunked-docs", output_filename)

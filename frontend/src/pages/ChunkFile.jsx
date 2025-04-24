@@ -19,7 +19,7 @@ const ChunkFile = () => {
 
   const fetchLoadedDocuments = async () => {
     try {
-      const response = await fetch(`${apiBaseUrl}/documents?type=loaded`);
+      const response = await fetch(`${apiBaseUrl}/documents?type=all`);
       const data = await response.json();
       setLoadedDocuments(data.documents);
 
@@ -80,6 +80,9 @@ const ChunkFile = () => {
     try {
       const docId = selectedDoc.endsWith('.json') ? selectedDoc : `${selectedDoc}.json`;
       
+      const selectedDocument = loadedDocuments.find(doc => doc.name === selectedDoc);
+      const docType = selectedDocument?.type || 'loaded';
+      
       const response = await fetch(`${apiBaseUrl}/chunk`, {
         method: 'POST',
         headers: {
@@ -89,6 +92,7 @@ const ChunkFile = () => {
           doc_id: docId,
           chunking_option: chunkingOption,
           chunk_size: chunkSize,
+          doc_type: docType
         }),
       });
 
