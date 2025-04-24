@@ -11,31 +11,37 @@ const Search = () => {
   const [topK, setTopK] = useState(3);
   const [threshold, setThreshold] = useState(0.7);
   const [collections, setCollections] = useState([]);
-  const [providers, setProviders] = useState([]);
   const [selectedProvider, setSelectedProvider] = useState('milvus');
   const [wordCountThreshold, setWordCountThreshold] = useState(100);
   const [saveResults, setSaveResults] = useState(false);
   const [status, setStatus] = useState('');
 
-  // 加载向量数据库providers和collections
-  useEffect(() => {
-    const fetchData = async () => {
-      try {
-        // 获取providers列表
-        const providersResponse = await fetch(`${apiBaseUrl}/providers`);
-        const providersData = await providersResponse.json();
-        setProviders(providersData.providers);
+  // 定义支持的向量数据库
+  const providers = [
+    { id: 'milvus', name: 'Milvus' },
+    { id: 'chroma', name: 'ChromaDB' }
+  ];
 
-        // 获取collections列表
-        const collectionsResponse = await fetch(`${apiBaseUrl}/collections?provider=${selectedProvider}`);
-        const collectionsData = await collectionsResponse.json();
-        setCollections(collectionsData.collections);
+  // 加载collections
+  useEffect(() => {
+    const fetchCollections = async () => {
+      try {
+        setStatus('正在加载集合列表...');
+        const response = await fetch(`${apiBaseUrl}/collections?provider=${selectedProvider}`);
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        const data = await response.json();
+        setCollections(data.collections || []);
+        setStatus('');
       } catch (error) {
-        console.error('Error fetching data:', error);
+        console.error('Error fetching collections:', error);
+        setStatus(`加载集合列表失败: ${error.message}`);
+        setCollections([]);
       }
     };
 
-    fetchData();
+    fetchCollections();
   }, [selectedProvider]);
 
   const handleSearch = async () => {
@@ -45,12 +51,12 @@ const Search = () => {
     }
 
     setIsSearching(true);
-    setStatus('');
+    setStatus('正在搜索...');
     try {
       const searchParams = {
         query,
         collection_id: collection,
-        provider: selectedProvider,  // 添加这一行
+        provider: selectedProvider,
         top_k: topK,
         threshold,
         word_count_threshold: wordCountThreshold,
@@ -94,7 +100,6 @@ const Search = () => {
     }
   };
 
-  // 添加保存结果的函数
   const handleSaveResults = async () => {
     if (!results.length) {
       setStatus('没有可保存的搜索结果');
@@ -132,7 +137,7 @@ const Search = () => {
 
   return (
     <div className="p-6">
-      <h2 className="text-2xl font-bold mb-6">Similarity Search</h2>
+      <h2 className="text-2xl font-bold mb-6">相似度搜索</h2>
       
       <div className="grid grid-cols-12 gap-6">
         {/* Left Panel - Search Controls */}
@@ -140,17 +145,17 @@ const Search = () => {
           <div className="p-4 border rounded-lg bg-white shadow-sm">
             <div className="space-y-4">
               <div>
-                <label className="block text-sm font-medium mb-1">Your Question</label>
+                <label className="block text-sm font-medium mb-1">搜索问题</label>
                 <textarea
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
-                  placeholder="Enter your search query..."
+                  placeholder="请输入您的搜索问题..."
                   className="block w-full p-2 border rounded h-32 resize-none"
                 />
               </div>
 
               <div>
-                <label className="block text-sm font-medium mb-1">Vector Database</label>
+                <label className="block text-sm font-medium mb-1">向量数据库</label>
                 <select
                   value={selectedProvider}
                   onChange={(e) => setSelectedProvider(e.target.value)}
@@ -165,23 +170,23 @@ const Search = () => {
               </div>
 
               <div>
-                <label className="block text-sm font-medium mb-1">Collection</label>
+                <label className="block text-sm font-medium mb-1">集合</label>
                 <select
                   value={collection}
                   onChange={(e) => setCollection(e.target.value)}
                   className="block w-full p-2 border rounded"
                 >
-                  <option value="">Choose a collection...</option>
+                  <option value="">选择集合...</option>
                   {collections.map(coll => (
                     <option key={coll.id} value={coll.id}>
-                      {coll.name} ({coll.count} documents)
+                      {coll.name} ({coll.count} 个向量)
                     </option>
                   ))}
                 </select>
               </div>
 
               <div>
-                <label className="block text-sm font-medium mb-1">Top K Results</label>
+                <label className="block text-sm font-medium mb-1">返回结果数量</label>
                 <input
                   type="number"
                   value={topK}
@@ -194,7 +199,7 @@ const Search = () => {
 
               <div>
                 <label className="block text-sm font-medium mb-1">
-                  Similarity Threshold: {threshold}
+                  相似度阈值: {threshold}
                 </label>
                 <input
                   type="range"
@@ -209,7 +214,7 @@ const Search = () => {
 
               <div>
                 <label className="block text-sm font-medium mb-1">
-                  Minimum Word Count: {wordCountThreshold}
+                  最小词数: {wordCountThreshold}
                 </label>
                 <input
                   type="range"
@@ -227,33 +232,28 @@ const Search = () => {
                   <input
                     type="checkbox"
                     checked={saveResults}
-                    onChange={(e) => {
-                      const newValue = e.target.checked;
-                      console.log('Save Results changed to:', newValue);
-                      setSaveResults(newValue);
-                    }}
+                    onChange={(e) => setSaveResults(e.target.checked)}
                     className="form-checkbox h-4 w-4 text-blue-600"
                   />
-                  <span className="text-sm font-medium">Save Search Results</span>
+                  <span className="text-sm font-medium">保存搜索结果</span>
                 </label>
               </div>
 
               <button 
-                onClick={() => {
-                  console.log('Search clicked with saveResults:', saveResults);
-                  handleSearch();
-                }}
+                onClick={handleSearch}
                 disabled={isSearching}
                 className="w-full px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 disabled:bg-blue-300"
               >
-                {isSearching ? 'Searching...' : 'Search'}
+                {isSearching ? '搜索中...' : '开始搜索'}
               </button>
             </div>
           </div>
 
           {status && (
             <div className={`p-4 rounded-lg ${
-              status.includes('错误') ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'
+              status.includes('错误') || status.includes('失败') 
+                ? 'bg-red-100 text-red-700' 
+                : 'bg-green-100 text-green-700'
             }`}>
               {status}
             </div>
@@ -265,7 +265,7 @@ const Search = () => {
           {results.length > 0 ? (
             <div className="p-4">
               <div className="flex justify-between items-center mb-4">
-                <h3 className="text-xl font-semibold">Search Results</h3>
+                <h3 className="text-xl font-semibold">搜索结果</h3>
                 <button
                   onClick={handleSaveResults}
                   className="px-4 py-2 bg-green-500 text-white rounded hover:bg-green-600"
@@ -278,21 +278,21 @@ const Search = () => {
                   <div key={idx} className="p-4 border rounded bg-gray-50">
                     <div className="flex justify-between items-start mb-2">
                       <span className="font-medium text-sm text-gray-500">
-                        Match Score: {(result.score * 100).toFixed(1)}%
+                        相似度: {(result.score * 100).toFixed(1)}%
                       </span>
                       <div className="text-sm text-gray-500">
-                        <div>Source: {result.metadata.source}</div>
-                        <div>Page: {result.metadata.page}</div>
-                        <div>Chunk: {result.metadata.chunk}</div>
+                        <div>文档: {result.metadata?.document_name || 'N/A'}</div>
+                        <div>页码: {result.metadata?.page_number || 'N/A'}</div>
+                        <div>块号: {result.metadata?.chunk_id || 'N/A'}</div>
                       </div>
                     </div>
-                    <p className="text-sm whitespace-pre-wrap">{result.text}</p>
+                    <p className="text-sm whitespace-pre-wrap">{result.content || result.text}</p>
                   </div>
                 ))}
               </div>
             </div>
           ) : (
-            <RandomImage message="Search results will appear here" />
+            <RandomImage message="搜索结果将在这里显示" />
           )}
         </div>
       </div>

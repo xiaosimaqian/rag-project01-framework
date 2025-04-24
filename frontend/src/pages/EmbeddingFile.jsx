@@ -104,9 +104,9 @@ const EmbeddingFile = () => {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          documentId: selectedDoc,  // 使用完整的文件名
-          provider: embeddingProvider,
-          model: embeddingModel
+          documentId: selectedDoc,
+          embeddingProvider: embeddingProvider,
+          embeddingModel: embeddingModel
         }),
       });
       

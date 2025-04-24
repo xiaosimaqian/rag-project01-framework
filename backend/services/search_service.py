@@ -2,7 +2,8 @@ from typing import List, Dict, Any, Optional
 import logging
 from datetime import datetime
 from pymilvus import connections, Collection, utility
-from services.embedding_service import EmbeddingService
+from services.embedding_service import EmbeddingService, EmbeddingConfig
+from services.vector_store_service import VectorStoreService, VectorDBConfig
 from utils.config import VectorDBProvider, MILVUS_CONFIG, CHROMA_CONFIG
 from fastapi import FastAPI, HTTPException
 import os
@@ -23,6 +24,7 @@ class SearchService:
         创建嵌入服务实例，设置Milvus连接URI，初始化搜索结果保存目录
         """
         self.embedding_service = EmbeddingService()
+        self.vector_store_service = VectorStoreService()
         self.milvus_uri = MILVUS_CONFIG["uri"]
         self.chroma_service = None
         self.search_results_dir = "04-search-results"
@@ -34,159 +36,67 @@ class SearchService:
         if self.chroma_service is None:
             self.chroma_service = ChromaService()
 
-    async def search(self, 
-                query: str, 
-                collection_id: str, 
-                provider: str = VectorDBProvider.MILVUS.value,
-                top_k: int = 3, 
-                threshold: float = 0.7,
-                word_count_threshold: int = 20,
-                save_results: bool = False) -> Dict[str, Any]:
+    async def search(
+        self,
+        query: str,
+        collection_name: str,
+        provider: str,
+        top_k: int = 3,
+        threshold: float = 0.7,
+        word_count_threshold: int = 100
+    ) -> List[Dict[str, Any]]:
         """
-        执行向量搜索
-        
-        Args:
-            query (str): 搜索查询文本
-            collection_id (str): 要搜索的集合ID
-            provider (str): 向量数据库提供商，默认为Milvus
-            top_k (int): 返回的最大结果数量，默认为3
-            threshold (float): 相似度阈值，低于此值的结果将被过滤，默认为0.7
-            word_count_threshold (int): 文本字数阈值，低于此值的结果将被过滤，默认为20
-            save_results (bool): 是否保存搜索结果，默认为False
-            
-        Returns:
-            Dict[str, Any]: 包含搜索结果的字典，如果保存结果则包含保存路径
+        执行相似度搜索
         """
         try:
-            # 添加参数日志
-            logger.info(f"Search parameters:")
-            logger.info(f"- Query: {query}")
-            logger.info(f"- Collection ID: {collection_id}")
-            logger.info(f"- Provider: {provider}")
-            logger.info(f"- Top K: {top_k}")
-            logger.info(f"- Threshold: {threshold}")
-            logger.info(f"- Word Count Threshold: {word_count_threshold}")
-            logger.info(f"- Save Results: {save_results}")
-
-            if provider == VectorDBProvider.CHROMA.value:
-                # 使用 Chroma 进行搜索
-                self._init_chroma_service()
-                results = self.chroma_service.search(
-                    query=query,
-                    collection_name=collection_id,
-                    n_results=top_k,
-                    where={"word_count": {"$gte": word_count_threshold}}
-                )
-                
-                # 处理 Chroma 的搜索结果
-                processed_results = []
-                for doc in results:
-                    if doc["distance"] >= threshold:  # Chroma 返回的是相似度，不需要转换
-                        processed_results.append({
-                            "text": doc["document"],
-                            "score": float(doc["distance"]),
-                            "metadata": {
-                                "source": doc["metadata"].get("source", ""),
-                                "page": doc["metadata"].get("page", ""),
-                                "chunk": doc["metadata"].get("chunk", ""),
-                                "total_chunks": doc["metadata"].get("total_chunks", ""),
-                                "page_range": doc["metadata"].get("page_range", ""),
-                                "word_count": doc["metadata"].get("word_count", 0),
-                                "embedding_provider": doc["metadata"].get("embedding_provider", ""),
-                                "embedding_model": doc["metadata"].get("embedding_model", ""),
-                                "embedding_timestamp": doc["metadata"].get("embedding_timestamp", "")
-                            }
-                        })
-            else:
-                # 使用 Milvus 进行搜索
-                connections.connect(
-                    alias="default",
-                    uri=self.milvus_uri
-                )
-                
-                try:
-                    # 检查集合是否存在
-                    if not utility.has_collection(collection_id):
-                        raise ValueError(f"Collection '{collection_id}' does not exist")
-                    
-                    collection = Collection(collection_id)
-                    collection.load()
-                    
-                    # 从collection中读取embedding配置
-                    sample_entity = collection.query(
-                        expr="id >= 0", 
-                        output_fields=["embedding_provider", "embedding_model"],
-                        limit=1
-                    )
-                    if not sample_entity:
-                        raise ValueError(f"Collection {collection_id} is empty")
-                    
-                    # 使用collection中存储的配置创建查询向量
-                    query_embedding = self.embedding_service.create_single_embedding(
-                        query,
-                        provider=sample_entity[0]["embedding_provider"],
-                        model=sample_entity[0]["embedding_model"]
-                    )
-                    
-                    # 执行搜索
-                    search_params = {
-                        "metric_type": "COSINE",
-                        "params": {"nprobe": 10}
-                    }
-                    
-                    results = collection.search(
-                        data=[query_embedding],
-                        anns_field="vector",
-                        param=search_params,
-                        limit=top_k,
-                        expr=f"word_count >= {word_count_threshold}",
-                        output_fields=[
-                            "content",
-                            "document_name",
-                            "chunk_id",
-                            "total_chunks",
-                            "word_count",
-                            "page_number",
-                            "page_range",
-                            "embedding_provider",
-                            "embedding_model",
-                            "embedding_timestamp"
-                        ]
-                    )
-                    
-                    # 处理 Milvus 的搜索结果
-                    processed_results = []
-                    for hits in results:
-                        for hit in hits:
-                            if hit.score >= threshold:
-                                processed_results.append({
-                                    "text": hit.entity.content,
-                                    "score": float(hit.score),
-                                    "metadata": {
-                                        "source": hit.entity.document_name,
-                                        "page": hit.entity.page_number,
-                                        "chunk": hit.entity.chunk_id,
-                                        "total_chunks": hit.entity.total_chunks,
-                                        "page_range": hit.entity.page_range,
-                                        "embedding_provider": hit.entity.embedding_provider,
-                                        "embedding_model": hit.entity.embedding_model,
-                                        "embedding_timestamp": hit.entity.embedding_timestamp
-                                    }
-                                })
-                finally:
-                    connections.disconnect("default")
-
-            response_data = {"results": processed_results}
+            logger.info(f"开始搜索，提供商: {provider}, 集合: {collection_name}")
             
-            # 保存搜索结果
-            if save_results and processed_results:
-                filepath = self.save_search_results(query, collection_id, processed_results)
-                response_data["saved_filepath"] = filepath
+            # 获取原始文档使用的嵌入配置
+            embedding_config = self.embedding_service.get_document_embedding_config(collection_name)
             
-            return response_data
+            # 创建向量数据库配置
+            vector_db_config = VectorDBConfig(
+                provider=provider,
+                index_mode="flat"  # 使用默认的 flat 索引模式进行搜索
+            )
+            
+            # 验证配置
+            if not vector_db_config.uri:
+                raise ValueError(f"向量数据库 URI 配置不正确，提供商: {provider}")
+            
+            logger.info(f"使用向量数据库配置: {vector_db_config.__dict__}")
+            
+            # 生成查询向量
+            logger.info(f"使用 {embedding_config.provider} - {embedding_config.model_name} 生成查询向量")
+            query_embedding = await self.embedding_service.create_single_embedding(
+                text=query,
+                config=embedding_config
+            )
+            
+            # 执行向量搜索
+            logger.info(f"在集合 {collection_name} 中执行向量搜索")
+            results = self.vector_store_service.search(
+                query_embedding=query_embedding,
+                collection_name=collection_name,
+                provider=provider,
+                config=vector_db_config,
+                top_k=top_k,
+                threshold=threshold
+            )
+            
+            # 过滤结果
+            if word_count_threshold > 0:
+                filtered_results = [
+                    r for r in results 
+                    if r["metadata"].get("word_count", 0) >= word_count_threshold
+                ]
+                logger.info(f"基于词数阈值过滤结果，从 {len(results)} 减少到 {len(filtered_results)}")
+                results = filtered_results
+            
+            return results
             
         except Exception as e:
-            logger.error(f"Error performing search: {e}")
+            logger.error(f"搜索操作出错: {e}", exc_info=True)
             raise
 
     def get_providers(self) -> List[Dict[str, str]]:

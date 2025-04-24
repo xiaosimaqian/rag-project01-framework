@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from services.loading_service import LoadingService
 from services.chunking_service import ChunkingService
 from services.embedding_service import EmbeddingService, EmbeddingConfig
-from services.vector_store_service import VectorStoreService, VectorDBConfig
+from services.vector_store_service import VectorStoreService, VectorDBConfig, VectorDBProvider
 from services.search_service import SearchService
 from services.parsing_service import ParsingService
 import logging
@@ -20,18 +20,24 @@ from fastapi import FastAPI, Body, HTTPException
 from utils.config import VectorDBProvider
 from services.search_service import SearchService
 import logging
-from pymilvus import connections
+from pymilvus import connections, utility
+from services.document_processor_service import DocumentProcessor
 
 # 设置日志
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
+vector_store_service = None
 
 # 确保必要的目录存在
-os.makedirs("temp", exist_ok=True)
-os.makedirs("01-chunked-docs", exist_ok=True)
-os.makedirs("02-embedded-docs", exist_ok=True)
+BASE_DIR = os.path.dirname(__file__)  # 指向 backend 目录
+os.makedirs(os.path.join(BASE_DIR, "temp"), exist_ok=True)
+os.makedirs(os.path.join(BASE_DIR, "01-chunked-docs"), exist_ok=True)
+os.makedirs(os.path.join(BASE_DIR, "02-embedded-docs"), exist_ok=True)
+os.makedirs(os.path.join(BASE_DIR, "01-original-docs"), exist_ok=True)
+os.makedirs(os.path.join(BASE_DIR, "03-vector-store"), exist_ok=True)
+os.makedirs(os.path.join(BASE_DIR, "04-search-results"), exist_ok=True)
 
 # Configure CORS
 app.add_middleware(
@@ -45,65 +51,91 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("Starting up the application...")
-    # 可以在这里添加 Milvus 连接初始化
+    """在应用启动时初始化服务"""
+    global vector_store_service
+    try:
+        vector_store_service = VectorStoreService()
+        collections = vector_store_service.list_collections(provider=VectorDBProvider.MILVUS.value)
+        logger.info(f"应用启动时找到以下集合：{collections}")
+    except Exception as e:
+        logger.error(f"应用启动时初始化服务出错: {e}")
+        # 不要在这里抛出异常，让应用继续启动
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    logger.info("Shutting down the application...")
-    try:
-        # 确保所有 Milvus 连接都被正确关闭
-        for alias in connections.list_connections():
-            connections.disconnect(alias)
-            logger.info(f"Disconnected Milvus connection: {alias}")
-    except Exception as e:
-        logger.error(f"Error during shutdown: {str(e)}")
+    """在应用关闭时清理资源"""
+    global vector_store_service
+    if vector_store_service:
+        try:
+            vector_store_service._disconnect_milvus()
+            logger.info("应用关闭时成功断开 Milvus 连接")
+        except Exception as e:
+            logger.warning(f"应用关闭时断开连接出错: {e}")
 
 @app.post("/process")
-async def process_file(
-    file: UploadFile = File(...),
-    loading_method: str = Form(...),
-    chunking_option: str = Form(...),
-    chunk_size: int = Form(1000)
+async def process_document(
+    file: UploadFile,
+    chunk_size: int = 500,
+    chunk_overlap: int = 50,
+    embedding_provider: str = "ollama",
+    embedding_model: str = "bge-m3:latest",
+    vector_db_provider: str = "milvus",
+    index_mode: str = "flat"
 ):
+    """处理上传的文档"""
     try:
-        # 保存上传的文件
-        temp_path = os.path.join("temp", file.filename)
-        with open(temp_path, "wb") as buffer:
+        # 1. 保存文件
+        file_path = os.path.join("01-original-docs", file.filename)
+        with open(file_path, "wb") as f:
             content = await file.read()
-            buffer.write(content)
-        
-        # 准备元数据
-        metadata = {
-            "filename": file.filename,
-            "loading_method": loading_method,
-            "original_file_size": len(content),
-            "processing_date": datetime.now().isoformat(),
-            "chunking_method": chunking_option,
-        }
-        
-        loading_service = LoadingService()
-        raw_text = loading_service.load_pdf(temp_path, loading_method)
-        metadata["total_pages"] = loading_service.get_total_pages()
-        
-        page_map = loading_service.get_page_map()
-        
-        chunking_service = ChunkingService()
-        chunks = chunking_service.chunk_text(
-            raw_text, 
-            chunking_option, 
-            metadata,
-            page_map=page_map,
-            chunk_size=chunk_size
+            f.write(content)
+            
+        # 2. 创建嵌入配置
+        embedding_config = EmbeddingConfig(
+            provider=embedding_provider,
+            model_name=embedding_model
         )
         
-        # 清理临时文件
-        os.remove(temp_path)
+        # 3. 处理文档
+        processor = DocumentProcessor()
+        chunks = processor.process_document(
+            file_path,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap
+        )
         
-        return {"chunks": chunks}
+        # 4. 创建嵌入
+        embedding_service = EmbeddingService()
+        embeddings = await embedding_service.create_embeddings(chunks, embedding_config)
+        
+        # 5. 保存嵌入结果
+        os.makedirs("02-embedded-docs", exist_ok=True)
+        output_path = os.path.join(
+            "02-embedded-docs",
+            f"{os.path.splitext(file.filename)[0]}_embeddings.json"
+        )
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(embeddings, f, ensure_ascii=False, indent=2)
+            
+        # 6. 创建向量数据库配置
+        vector_db_config = VectorDBConfig(
+            provider=vector_db_provider,
+            index_mode=index_mode
+        )
+        
+        # 7. 索引到向量数据库
+        vector_store = VectorStoreService()
+        index_result = vector_store.index_embeddings(output_path, vector_db_config)
+        
+        return {
+            "message": "文档处理和索引成功",
+            "embeddings_file": output_path,
+            "index_result": index_result
+        }
+        
     except Exception as e:
-        logger.error(f"Error processing file: {str(e)}")
-        raise
+        logger.error(f"处理文档时出错: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/save")
 async def save_chunks(data: dict):
@@ -161,71 +193,80 @@ async def list_documents():
         raise
 
 @app.post("/embed")
-async def embed_document(data: dict = Body(...)):
+async def embed_document(
+    data: dict = Body(...)
+):
+    """为文档创建嵌入向量"""
     try:
-        doc_id = data.get("documentId")
-        provider = data.get("provider")
-        model = data.get("model")
+        # 从请求中获取参数
+        document_id = data.get("documentId")
+        embedding_provider = data.get("embeddingProvider", "ollama")
+        embedding_model = data.get("embeddingModel", "bge-m3:latest")
         
-        if not all([doc_id, provider, model]):
-            raise HTTPException(status_code=400, detail="Missing required parameters")
+        if not document_id:
+            raise ValueError("Missing documentId")
             
-        # 直接使用完整文件名查找
-        loaded_path = os.path.join("01-loaded-docs", doc_id)
-        chunked_path = os.path.join("01-chunked-docs", doc_id)
-        
-        doc_path = None
-        if os.path.exists(loaded_path):
-            doc_path = loaded_path
-        elif os.path.exists(chunked_path):
-            doc_path = chunked_path
+        # 构建文件路径 - 从 chunked-docs 目录读取
+        chunked_file_path = os.path.join("01-chunked-docs", document_id)
+        if not os.path.exists(chunked_file_path):
+            raise FileNotFoundError(f"Document not found: {chunked_file_path}")
             
-        if not doc_path:
-            raise HTTPException(status_code=404, detail=f"Document not found: {doc_id}")
+        # 读取分块后的文档
+        with open(chunked_file_path, 'r', encoding='utf-8') as f:
+            chunked_data = json.load(f)
             
-        with open(doc_path, 'r', encoding='utf-8') as f:
-            doc_data = json.load(f)
-        
-        # 创建 EmbeddingConfig 和 EmbeddingService
-        config = EmbeddingConfig(provider=provider, model_name=model)
-        embedding_service = EmbeddingService()
-        
-        # 准备输入数据
-        input_data = {
-            "chunks": doc_data["chunks"],
-            "metadata": {
-                "filename": doc_data["filename"],
-                "total_chunks": doc_data["total_chunks"],
-                "total_pages": doc_data["total_pages"],
-                "loading_method": doc_data["loading_method"],
-                "chunking_method": doc_data["chunking_method"]
-            }
+        # 准备元数据
+        metadata = {
+            "document_name": os.path.splitext(document_id)[0],
+            "embedding_provider": embedding_provider,
+            "embedding_model": embedding_model,
+            "created_at": datetime.now().isoformat()
         }
         
-        # 创建嵌入 - 只接收两个返回值
-        embeddings, _ = embedding_service.create_embeddings(input_data, config)
+        # 如果分块数据中有元数据，则合并
+        if "metadata" in chunked_data:
+            metadata.update(chunked_data["metadata"])
         
-        # 保存嵌入结果
-        output_path = embedding_service.save_embeddings(doc_id, embeddings)
+        # 创建嵌入配置
+        embedding_config = EmbeddingConfig(
+            provider=embedding_provider,
+            model_name=embedding_model
+        )
+        
+        # 创建嵌入
+        embedding_service = EmbeddingService()
+        embeddings = embedding_service.create_embeddings(
+            chunks=chunked_data["chunks"],
+            metadata=metadata
+        )
+        
+        # 保存嵌入向量
+        doc_name = os.path.splitext(document_id)[0]  # 移除 .json 后缀
+        filepath = embedding_service.save_embeddings(doc_name, embeddings)
         
         return {
             "status": "success",
-            "message": "Embeddings created successfully",
-            "filepath": output_path,
-            "embeddings": embeddings  # 添加embeddings到响应中
+            "message": "Embedding completed successfully",
+            "filepath": filepath,
+            "embeddings": embeddings["embeddings"],  # 只返回嵌入向量部分
+            "documentId": document_id,
+            "embeddingProvider": embedding_provider,
+            "embeddingModel": embedding_model
         }
         
     except Exception as e:
-        logger.error(f"Error creating embeddings: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error creating embeddings: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
 
 @app.get("/list-embedded")
 async def list_embedded_docs():
     """List all embedded documents"""
     try:
         documents = []
-        # 修改目录路径以匹配 save_embeddings 中的路径
-        embedded_dir = os.path.join("backend", "02-embedded-docs")
+        embedded_dir = os.path.join("02-embedded-docs")
         logger.info(f"Scanning directory: {embedded_dir}")
         
         if not os.path.exists(embedded_dir):
@@ -239,15 +280,16 @@ async def list_embedded_docs():
                 try:
                     with open(file_path, 'r', encoding='utf-8') as f:
                         data = json.load(f)
-                        # 使用实际的文件名，而不是文档名
+                        # 从metadata字段中获取信息
+                        metadata = data.get("metadata", {})
                         doc_info = {
-                            "name": filename,  # 保持原始文件名
+                            "name": filename,
                             "metadata": {
-                                "document_name": data.get("filename", filename),
-                                "embedding_model": data.get("embedding_model", ""),
-                                "embedding_provider": data.get("embedding_provider", ""),
-                                "embedding_timestamp": data.get("created_at", ""),
-                                "vector_dimension": data.get("vector_dimension", 0)
+                                "document_name": metadata.get("document_name", filename),
+                                "embedding_model": metadata.get("embedding_model", "unknown"),
+                                "embedding_provider": metadata.get("embedding_provider", "unknown"),
+                                "embedding_timestamp": metadata.get("created_at", ""),
+                                "vector_dimension": metadata.get("vector_dimension", 0)
                             }
                         }
                         logger.info(f"Added document info: {doc_info}")
@@ -262,71 +304,65 @@ async def list_embedded_docs():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/index")
-async def index_embeddings(data: dict):
+async def index_document(
+    data: dict = Body(...)
+):
     try:
-        file_id = data.get("fileId")
-        vector_db = data.get("vectorDb")
-        index_mode = data.get("indexMode")
-
-        if not all([file_id, vector_db, index_mode]):
-            raise ValueError("Missing required fields")
-
-        # --- 修改路径 ---
-        # 确保使用相对于 backend 目录的正确路径
-        embedding_file = os.path.join("backend", "02-embedded-docs", file_id)
-        logger.info(f"Attempting to index file at path: {embedding_file}") # 添加日志记录
-        # --- 结束修改 ---
-
-        if not os.path.exists(embedding_file):
-            logger.error(f"File not found at path: {embedding_file}") # 添加错误日志
-            # 可能需要检查 file_id 是否包含 .json 后缀
-            if not file_id.endswith('.json'):
-                 logger.warning(f"Provided fileId '{file_id}' does not end with .json. Trying with .json appended.")
-                 embedding_file_json = embedding_file + '.json'
-                 if os.path.exists(embedding_file_json):
-                      embedding_file = embedding_file_json
-                      logger.info(f"Found file by appending .json: {embedding_file}")
-                 else:
-                      raise FileNotFoundError(f"Embedding file not found: {file_id} (or {file_id}.json)")
-            else:
-                 raise FileNotFoundError(f"Embedding file not found: {file_id}")
-
-
-        config = VectorDBConfig(
-            provider=vector_db,
-            index_mode=index_mode
+        # 从请求中获取参数
+        embeddings_file = data.get("embeddingsFile")
+        if not embeddings_file:
+            raise HTTPException(status_code=400, detail="未提供embeddingsFile参数")
+            
+        # 构建完整的文件路径
+        embeddings_path = os.path.join(os.path.dirname(__file__), "02-embedded-docs", embeddings_file)
+        if not os.path.exists(embeddings_path):
+            raise HTTPException(status_code=404, detail=f"嵌入文件不存在: {embeddings_file}")
+            
+        # 读取嵌入文件
+        with open(embeddings_path, 'r', encoding='utf-8') as f:
+            embeddings_data = json.load(f)
+            
+        # 获取集合名称
+        collection_name = data.get("targetCollectionName")
+        if not collection_name:
+            # 如果没有指定集合名称，使用嵌入文件的名称（去掉.json后缀）
+            collection_name = os.path.splitext(embeddings_file)[0]
+            
+        # 创建向量数据库配置
+        vector_db_config = VectorDBConfig(
+            provider="milvus",
+            index_mode="HNSW",
+            target_collection_name=collection_name
         )
-        vector_store_service = VectorStoreService()
-        # --- 传递正确的路径给服务 ---
-        # index_embeddings 内部的 _load_embeddings 也需要正确的路径
-        result_details = vector_store_service.index_embeddings(embedding_file, config)
-        # --- 结束传递 ---
-
-        # 构造包含 message 的响应 (根据之前的修改)
-        success_message = (
-            f"Indexing completed successfully for collection '{result_details.get('collection_name', 'N/A')}'. "
-            f"Processed {result_details.get('total_vectors', 'N/A')} vectors. "
-            f"Time: {result_details.get('processing_time', 'N/A'):.2f}s. "
-            f"Index Size Info: {result_details.get('index_size', 'N/A')}."
-        )
-        logger.info(success_message) # Log the detailed message
-
+        
+        # 创建向量存储服务实例
+        vector_store = VectorStoreService()
+        
+        # 执行索引
+        result = vector_store.index_embeddings(embeddings_data, vector_db_config)
+        
+        # 验证返回的数据结构
+        if not isinstance(result, dict):
+            raise ValueError("索引结果格式错误")
+            
+        if "details" not in result:
+            raise ValueError("索引结果缺少details字段")
+            
+        if "total_vectors" not in result["details"]:
+            raise ValueError("索引结果缺少total_vectors字段")
+            
+        if result["details"]["total_vectors"] == 0:
+            raise ValueError("索引结果中向量数量为0")
+            
         return {
-            "message": success_message,
-            "details": result_details # Optionally keep details if frontend needs them
+            "status": "success",
+            "message": "文档索引成功",
+            "data": result
         }
-    except FileNotFoundError as fnf_error: # Catch FileNotFoundError specifically
-        logger.error(f"Error during indexing - File Not Found: {fnf_error}", exc_info=True)
-        raise HTTPException(
-            status_code=404, # Use 404 for File Not Found
-            detail=str(fnf_error)
-        )
+        
     except Exception as e:
-        logger.error(f"Error during indexing: {str(e)}", exc_info=True) # Add exc_info for full traceback
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
-        )
+        logger.error(f"索引文档失败: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/providers")
 async def get_providers():
@@ -368,30 +404,51 @@ async def search(
     word_count_threshold: int = Body(100),
     save_results: bool = Body(False)
 ):
-    """执行向量搜索"""
+    """
+    执行相似度搜索
+    """
     try:
-        # Log the incoming search request details
-        logger.info(f"Search request - Query: {query}, Collection: {collection_id}, Provider: {provider}, Top K: {top_k}, Threshold: {threshold}, Word Count Threshold: {word_count_threshold}")
+        logger.info(f"Search request - Query: {query}, Collection: {collection_id}, Provider: {provider}, "
+                   f"Top K: {top_k}, Threshold: {threshold}, Word Count Threshold: {word_count_threshold}")
         
+        # 创建搜索服务实例
         search_service = SearchService()
         
-        # Log before calling the search function
-        logger.info("Calling search service...")
-        
+        # 执行搜索
         results = await search_service.search(
             query=query,
-            collection_id=collection_id,
+            collection_name=collection_id,
             provider=provider,
             top_k=top_k,
             threshold=threshold,
-            word_count_threshold=word_count_threshold,
-            save_results=save_results
+            word_count_threshold=word_count_threshold
         )
         
-        # Log the search results
-        logger.info(f"Search response: {results}")
+        # 如果需要保存结果
+        if save_results:
+            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            filename = f"search_results_{timestamp}.json"
+            filepath = os.path.join("04-search-results", filename)
+            
+            # 确保目录存在
+            os.makedirs("04-search-results", exist_ok=True)
+            
+            # 保存搜索结果
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump({
+                    "query": query,
+                    "collection": collection_id,
+                    "timestamp": timestamp,
+                    "results": results
+                }, f, ensure_ascii=False, indent=2)
+            
+            return {
+                "results": results,
+                "saved_filepath": filepath
+            }
         
-        return results
+        return {"results": results}
+        
     except Exception as e:
         logger.error(f"Error performing search: {str(e)}")
         raise HTTPException(
@@ -1035,4 +1092,78 @@ async def get_search_result(file_id: str):
             
     except Exception as e:
         logger.error(f"Error reading search result file: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e)) 
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/indexing")
+async def list_embedding_files():
+    """列出所有可用的嵌入文件"""
+    try:
+        embedding_dir = os.path.join("02-embedded-docs")
+        logger.info(f"正在扫描目录: {embedding_dir}")
+        logger.info(f"当前工作目录: {os.getcwd()}")
+        
+        if not os.path.exists(embedding_dir):
+            logger.warning(f"目录不存在: {embedding_dir}")
+            return {
+                "message": "嵌入文件目录不存在",
+                "embedding_files": []
+            }
+            
+        embedding_files = []
+        for file in os.listdir(embedding_dir):
+            if file.endswith('.json'):
+                file_path = os.path.join(embedding_dir, file)
+                logger.info(f"正在读取文件: {file_path}")
+                # 读取文件以获取更多信息
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    try:
+                        data = json.load(f)
+                        embedding_files.append({
+                            "filename": file,
+                            "filepath": file_path,
+                            "document_name": data.get("filename", ""),
+                            "embedding_provider": data.get("embedding_provider", "unknown"),
+                            "embedding_model": data.get("embedding_model", "unknown"),
+                            "vector_dimension": data.get("vector_dimension", 0),
+                            "total_vectors": len(data.get("embeddings", [])),
+                            "created_at": data.get("created_at", "")
+                        })
+                        logger.info(f"成功添加文件信息: {file}")
+                    except json.JSONDecodeError:
+                        logger.warning(f"无法解析文件 {file}")
+                        continue
+        
+        if not embedding_files:
+            logger.warning("没有找到嵌入文件")
+            return {
+                "message": "没有找到嵌入文件",
+                "embedding_files": []
+            }
+            
+        # 按创建时间排序
+        embedding_files.sort(key=lambda x: x["created_at"], reverse=True)
+        logger.info(f"找到 {len(embedding_files)} 个嵌入文件")
+        
+        return {
+            "message": f"找到 {len(embedding_files)} 个嵌入文件",
+            "embedding_files": embedding_files
+        }
+        
+    except Exception as e:
+        logger.error(f"列出嵌入文件时出错: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+def get_available_collections():
+    """获取可用的集合列表"""
+    vector_store_service = VectorStoreService()
+    try:
+        collections = vector_store_service.list_collections(provider=VectorDBProvider.MILVUS.value)
+        logger.info(f"找到以下集合：{collections}")
+        return collections
+    except Exception as e:
+        logger.error(f"获取集合列表时出错: {e}")
+        return []
+
+# 在应用启动时使用这个函数
+collections = get_available_collections()
+print(f"可用的集合：{collections}") 

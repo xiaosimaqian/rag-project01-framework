@@ -283,13 +283,9 @@ class LoadingService:
         """
         try:
             timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
-            base_name = filename.replace('.pdf', '').split('_')[0]
-            
-            # Adjust the document name to include strategy if unstructured
-            if loading_method == "unstructured" and strategy:
-                doc_name = f"{base_name}_{loading_method}_{strategy}_{chunking_strategy}_{timestamp}"
-            else:
-                doc_name = f"{base_name}_{loading_method}_{timestamp}"
+            # 只使用原始文件名（不含扩展名）和时间戳
+            base_name = os.path.splitext(filename)[0]
+            doc_name = f"{base_name}_{timestamp}"
             
             # 构建文档数据结构，确保所有值都是可序列化的
             document_data = {

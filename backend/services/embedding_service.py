@@ -9,6 +9,10 @@ import numpy as np  # 添加这个导入
 from langchain_community.embeddings import BedrockEmbeddings, OpenAIEmbeddings, HuggingFaceEmbeddings
 from langchain_ollama import OllamaEmbeddings
 from langchain_ollama import OllamaLLM
+import logging
+from typing import Dict, Any, List
+
+logger = logging.getLogger(__name__)
 
 # 添加 CompactJSONEncoder 类定义
 class CompactJSONEncoder(json.JSONEncoder):
@@ -58,144 +62,147 @@ class EmbeddingService:
     def __init__(self):
         """初始化嵌入服务，创建嵌入工厂实例"""
         self.embedding_factory = EmbeddingFactory()
+        # 初始化默认的嵌入配置为 Ollama
+        self.embedding_config = EmbeddingConfig(
+            provider=EmbeddingProvider.OLLAMA.value,
+            model_name="bge-m3:latest"
+        )
 
-    def create_embeddings(self, input_data: dict, config: EmbeddingConfig) -> tuple:
-        """
-        创建文本块的嵌入向量并返回必要的信息
-        
-        参数:
-            input_data: 包含文本块和元数据的输入数据字典
-            config: 嵌入配置对象
+    def create_embeddings(
+            self,
+            chunks: List[Dict[str, Any]],
+            metadata: Dict[str, Any],
+            doc_timestamp: str = None,
+            embedding_config: EmbeddingConfig = None
+        ) -> Dict[str, Any]:
+        """创建文本块的嵌入向量"""
+        try:
+            if not chunks:
+                raise ValueError("没有可处理的文本块")
             
-        返回:
-            包含嵌入结果和元数据的元组
-        """
-        embedding_function = self.embedding_factory.create_embedding_function(config)
-        
-        chunks = input_data.get('chunks', [])
-        filename = input_data.get('metadata', {}).get('filename', '')  # 获取文件名
-        
-        # 批处理大小
-        BATCH_SIZE = 20
-        results = []
-        
-        # 如果是OpenAI，使用批处理
-        if config.provider == EmbeddingProvider.OPENAI:
-            for i in range(0, len(chunks), BATCH_SIZE):
-                batch = chunks[i:i + BATCH_SIZE]
-                # 提取当前批次的文本内容
-                texts = [chunk.get("content", "") for chunk in batch]
-                
-                # 批量获取embeddings
-                embedding_vectors = embedding_function.embed_documents(texts)
-                
-                # 将结果与原始chunk数据组合
-                for chunk, embedding_vector in zip(batch, embedding_vectors):
-                    metadata = {
-                        "chunk_id": chunk["metadata"]["chunk_id"],
-                        "page_number": chunk["metadata"]["page_number"],
-                        "page_range": chunk["metadata"]["page_range"],
-                        "content": chunk["content"],
-                        "word_count": chunk["metadata"]["word_count"],
-                        # "chunking_method": input_data.get("chunking_method", "loaded"),
-                        "total_chunks": len(chunks),
-                        "embedding_provider": config.provider,
-                        "embedding_model": config.model_name,
-                        "embedding_timestamp": datetime.now().isoformat(),
-                        "vector_dimension": len(embedding_vector),
-                        "filename": filename  # 添加文件名到metadata
-                    }
-                    
-                    embedding_result = {
-                        "embedding": embedding_vector,
-                        "metadata": metadata
-                    }
-                    results.append(embedding_result)
-        else:
-            # 对其他提供商保持原有的逐个处理逻辑
+            # 如果没有传入时间戳，则生成新的
+            if not doc_timestamp:
+                doc_timestamp = f"doc_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            
+            # 生成嵌入阶段的时间戳
+            emb_timestamp = f"emb_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            
+            # 使用传入的配置或默认配置
+            config = embedding_config or self.embedding_config
+            
+            # 准备嵌入结果
+            results = []
             for chunk in chunks:
-                embedding_vector = embedding_function.embed_query(chunk["content"])
-                metadata = {
-                    "chunk_id": chunk["metadata"]["chunk_id"],
-                    "page_number": chunk["metadata"]["page_number"],
-                    "page_range": chunk["metadata"]["page_range"],
+                # 创建嵌入向量
+                embedding = self.embedding_factory.create_embedding_function(config).embed_query(chunk["content"])
+                
+                # 准备元数据
+                chunk_metadata = {
                     "content": chunk["content"],
-                    "word_count": chunk["metadata"]["word_count"],
-                    # "chunking_method": input_data.get("chunking_method", "loaded"),
-                    "total_chunks": len(chunks),
+                    "chunk_id": chunk.get("chunk_id"),
+                    "page_number": chunk.get("page_number"),
+                    "word_count": len(chunk["content"].split()),
                     "embedding_provider": config.provider,
                     "embedding_model": config.model_name,
-                    "embedding_timestamp": datetime.now().isoformat(),
-                    "vector_dimension": len(embedding_vector),
-                    "filename": filename  # 添加文件名到metadata
+                    "doc_timestamp": doc_timestamp,
+                    "emb_timestamp": emb_timestamp
                 }
                 
-                embedding_result = {
-                    "embedding": embedding_vector,
-                    "metadata": metadata
-                }
-                results.append(embedding_result)
-        
-        # 返回结果和空的metadata（因为metadata已经包含在每个embedding中）
-        return results, {}
+                # 合并文档级别的元数据
+                chunk_metadata.update(metadata)
+                
+                results.append({
+                    "embedding": embedding,
+                    "metadata": chunk_metadata
+                })
+            
+            # 准备返回的数据结构
+            return {
+                "embeddings": results,
+                "metadata": {
+                    "document_name": metadata.get("document_name", ""),
+                    "embedding_provider": config.provider,
+                    "embedding_model": config.model_name,
+                    "created_at": datetime.now().isoformat(),
+                    "total_vectors": len(results),
+                    "vector_dimension": len(embedding) if results else 0,
+                    "doc_timestamp": doc_timestamp,
+                    "emb_timestamp": emb_timestamp
+                },
+                "doc_timestamp": doc_timestamp,
+                "emb_timestamp": emb_timestamp
+            }
+            
+        except Exception as e:
+            logger.error(f"创建嵌入向量失败: {str(e)}", exc_info=True)
+            raise
 
-    def save_embeddings(self, doc_name: str, embeddings: list) -> str:
+    def save_embeddings(self, doc_name: str, embeddings: Dict[str, Any]) -> str:
         """
-        保存嵌入向量到JSON文件
+        保存嵌入向量到文件
         
         参数:
             doc_name: 文档名称
-            embeddings: 嵌入向量列表，每个元素包含 embedding 和 metadata
+            embeddings: 嵌入向量数据
             
         返回:
             保存的文件路径
         """
-        # 修改保存路径
-        save_dir = os.path.join("backend", "02-embedded-docs")
-        os.makedirs(save_dir, exist_ok=True)
-        
-        # 获取第一个embedding的信息
-        first_embedding = embeddings[0]
-        provider = first_embedding["metadata"]["embedding_provider"]  # 从 metadata 中获取
-        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        
-        # 构建文件名
-        base_name = doc_name.split('_')[0]
-        if not base_name.endswith('.pdf'):
-            base_name += '.pdf'
-        
-        filename = f"{base_name.replace('.pdf', '')}_{provider}_{timestamp}.json"
-        filepath = os.path.join(save_dir, filename)
-        
-        # 构建输出数据结构
-        output_data = {
-            "filename": base_name,
-            "chunked_doc_name": doc_name,
-            "created_at": datetime.now().isoformat(),
-            "embedding_provider": provider,
-            "embedding_model": first_embedding["metadata"]["embedding_model"],  # 从 metadata 中获取
-            "vector_dimension": len(first_embedding["embedding"]),
-            "embeddings": embeddings
-        }
-        
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(output_data, f, ensure_ascii=False, indent=2, cls=CompactJSONEncoder)
+        try:
+            # 构建保存目录
+            save_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "02-embedded-docs")
+            os.makedirs(save_dir, exist_ok=True)
             
-        return filepath
+            # 生成文件名，确保不会重复添加时间戳
+            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            # 如果文件名已经包含时间戳，则不再添加
+            if '_' in doc_name and doc_name.split('_')[-1].isdigit() and len(doc_name.split('_')[-1]) == 14:
+                filename = f"{doc_name}.json"
+            else:
+                filename = f"{doc_name}_{timestamp}.json"
+            file_path = os.path.join(save_dir, filename)
+            
+            # 确保 embeddings 包含所有必要字段
+            if not isinstance(embeddings, dict):
+                raise ValueError("embeddings must be a dictionary")
+                
+            if "embeddings" not in embeddings:
+                raise ValueError("embeddings must contain an 'embeddings' key")
+                
+            # 添加元数据
+            embeddings["metadata"] = {
+                "filename": filename,
+                "timestamp": timestamp,
+                "total_vectors": len(embeddings["embeddings"]),
+                "document_name": doc_name,
+                "embedding_provider": embeddings.get("metadata", {}).get("embedding_provider", "unknown"),
+                "embedding_model": embeddings.get("metadata", {}).get("embedding_model", "unknown"),
+                "created_at": datetime.now().isoformat(),
+                "vector_dimension": embeddings.get("metadata", {}).get("vector_dimension", 0)
+            }
+            
+            # 保存数据
+            with open(file_path, 'w', encoding='utf-8') as f:
+                json.dump(embeddings, f, ensure_ascii=False, indent=2, cls=CompactJSONEncoder)
+                
+            logger.info(f"Successfully saved embeddings to {file_path}")
+            return file_path
+            
+        except Exception as e:
+            logger.error(f"Error saving embeddings: {str(e)}", exc_info=True)
+            raise ValueError(f"Failed to save embeddings: {str(e)}")
 
-    def create_single_embedding(self, text: str, provider: str, model: str) -> list:
+    async def create_single_embedding(self, text: str, config: EmbeddingConfig) -> list:
         """
         创建单个文本的嵌入向量
         
         参数:
             text: 需要嵌入的文本
-            provider: 嵌入提供商
-            model: 嵌入模型名称
+            config: 嵌入配置对象
             
         返回:
             嵌入向量列表
         """
-        config = EmbeddingConfig(provider=provider, model_name=model)
         embedding_function = self.embedding_factory.create_embedding_function(config)
         return embedding_function.embed_query(text)
 
@@ -213,8 +220,8 @@ class EmbeddingService:
             ValueError: 当找不到匹配的嵌入配置时抛出
         """
         try:
-            # 只取第一个下划线之前的部分
-            doc_name = collection_name.split('_')[0]
+            # 移除 'collection_' 前缀，并分割后面的部分
+            doc_name = collection_name.replace('collection_', '').split('_')[0]
             
             # 查找对应的embedding文件
             embedded_docs_dir = "02-embedded-docs"
@@ -222,16 +229,18 @@ class EmbeddingService:
                 if filename.endswith('.json'):
                     with open(os.path.join(embedded_docs_dir, filename), 'r', encoding='utf-8') as f:
                         data = json.load(f)
-                        # 使用 filename 而不是 document_name
-                        if data.get("filename") == doc_name:
+                        # 检查文档名称是否匹配
+                        if doc_name in data.get("filename", ""):
+                            logger.info(f"找到匹配的嵌入配置：{data.get('embedding_provider')} - {data.get('embedding_model')}")
                             return EmbeddingConfig(
                                 provider=data.get("embedding_provider"),
                                 model_name=data.get("embedding_model")
                             )
                             
-            raise ValueError(f"No matching embedding configuration found for collection: {collection_name}")
+            raise ValueError(f"未找到集合的匹配嵌入配置: {collection_name}")
         except Exception as e:
-            raise ValueError(f"Error getting embedding config: {str(e)}")
+            logger.error(f"获取嵌入配置时出错: {str(e)}")
+            raise ValueError(f"获取嵌入配置时出错: {str(e)}")
 
 class EmbeddingFactory:
     """
