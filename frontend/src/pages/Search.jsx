@@ -54,13 +54,11 @@ const Search = () => {
     setStatus('正在搜索...');
     try {
       const searchParams = {
-        query,
-        collection_id: collection,
+        query: query,
+        collection_name: collection,
         provider: selectedProvider,
         top_k: topK,
-        threshold,
-        word_count_threshold: wordCountThreshold,
-        save_results: saveResults
+        threshold: threshold
       };
       
       console.log('发送搜索请求:', searchParams);
@@ -80,13 +78,9 @@ const Search = () => {
       const data = await response.json();
       console.log('搜索响应:', data);
 
-      if (data.results && data.results.length > 0) {
-        setResults(data.results);
-        if (saveResults && data.saved_filepath) {
-          setStatus(`搜索完成！结果已保存至: ${data.saved_filepath}`);
-        } else {
-          setStatus('搜索完成！');
-        }
+      if (data.details && data.details.hits && data.details.hits.length > 0) {
+        setResults(data.details.hits);
+        setStatus('搜索完成！');
       } else {
         setResults([]);
         setStatus('未找到匹配的结果');

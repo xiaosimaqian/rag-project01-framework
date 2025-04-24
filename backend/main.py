@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 vector_store_service = None
+search_service = None
 
 # 确保必要的目录存在
 BASE_DIR = os.path.dirname(__file__)  # 指向 backend 目录
@@ -52,9 +53,10 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup_event():
     """在应用启动时初始化服务"""
-    global vector_store_service
+    global vector_store_service, search_service
     try:
         vector_store_service = VectorStoreService()
+        search_service = SearchService()
         collections = vector_store_service.list_collections(provider=VectorDBProvider.MILVUS.value)
         logger.info(f"应用启动时找到以下集合：{collections}")
     except Exception as e:
@@ -396,65 +398,43 @@ async def get_collections(
 
 @app.post("/search")
 async def search(
-    query: str = Body(...),
-    collection_id: str = Body(...),
-    provider: str = Body(VectorDBProvider.MILVUS.value),
-    top_k: int = Body(3),
-    threshold: float = Body(0.7),
-    word_count_threshold: int = Body(100),
-    save_results: bool = Body(False)
+    data: dict = Body(...)
 ):
-    """
-    执行相似度搜索
-    """
+    """执行向量搜索"""
     try:
-        logger.info(f"Search request - Query: {query}, Collection: {collection_id}, Provider: {provider}, "
-                   f"Top K: {top_k}, Threshold: {threshold}, Word Count Threshold: {word_count_threshold}")
+        # 从请求体中获取参数
+        query = data.get("query")
+        collection_name = data.get("collection_name")
+        provider = data.get("provider", "milvus")
+        top_k = data.get("top_k", 3)
+        threshold = data.get("threshold", 0.7)
         
-        # 创建搜索服务实例
-        search_service = SearchService()
+        if not query or not collection_name:
+            raise HTTPException(status_code=400, detail="Missing required parameters: query and collection_name")
+            
+        logger.info(f"Search request - Query: {query}, Collection: {collection_name}, Provider: {provider}, Top K: {top_k}, Threshold: {threshold}")
+        
+        # 创建向量数据库配置
+        vector_db_config = VectorDBConfig(
+            provider=provider,
+            index_mode="flat"  # 使用默认的 flat 索引模式进行搜索
+        )
         
         # 执行搜索
         results = await search_service.search(
             query=query,
-            collection_name=collection_id,
+            collection_name=collection_name,
             provider=provider,
+            config=vector_db_config,
             top_k=top_k,
-            threshold=threshold,
-            word_count_threshold=word_count_threshold
+            threshold=threshold
         )
         
-        # 如果需要保存结果
-        if save_results:
-            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-            filename = f"search_results_{timestamp}.json"
-            filepath = os.path.join("04-search-results", filename)
-            
-            # 确保目录存在
-            os.makedirs("04-search-results", exist_ok=True)
-            
-            # 保存搜索结果
-            with open(filepath, "w", encoding="utf-8") as f:
-                json.dump({
-                    "query": query,
-                    "collection": collection_id,
-                    "timestamp": timestamp,
-                    "results": results
-                }, f, ensure_ascii=False, indent=2)
-            
-            return {
-                "results": results,
-                "saved_filepath": filepath
-            }
-        
-        return {"results": results}
+        return results
         
     except Exception as e:
-        logger.error(f"Error performing search: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
-        )
+        logger.error(f"Error performing search: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/collections/{provider}")
 async def get_provider_collections(provider: str):

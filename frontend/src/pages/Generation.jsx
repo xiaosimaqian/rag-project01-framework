@@ -248,14 +248,15 @@ const Generation = () => {
                     <div key={idx} className="p-4 border rounded bg-gray-50">
                       <div className="flex justify-between items-start mb-2">
                         <span className="font-medium text-sm text-gray-500">
-                          Match Score: {(result.score * 100).toFixed(1)}%
+                          相似度: {(result.score * 100).toFixed(1)}%
                         </span>
                         <div className="text-sm text-gray-500">
-                          <div>Source: {result.metadata.source}</div>
-                          <div>Page: {result.metadata.page}</div>
+                          <div>文档: {result.metadata?.document_name || 'N/A'}</div>
+                          <div>页码: {result.metadata?.page_number || 'N/A'}</div>
+                          <div>块号: {result.metadata?.chunk_id || 'N/A'}</div>
                         </div>
                       </div>
-                      <p className="text-sm whitespace-pre-wrap">{result.text}</p>
+                      <p className="text-sm whitespace-pre-wrap">{result.content}</p>
                     </div>
                   ))}
                   {searchResults.length === 0 && (

@@ -242,6 +242,24 @@ class EmbeddingService:
             logger.error(f"获取嵌入配置时出错: {str(e)}")
             raise ValueError(f"获取嵌入配置时出错: {str(e)}")
 
+    def create_embedding(self, text: str) -> List[float]:
+        """
+        创建单个文本的嵌入向量
+        
+        参数:
+            text: 需要嵌入的文本
+            
+        返回:
+            嵌入向量列表
+        """
+        try:
+            # 使用默认配置创建嵌入向量
+            embedding_function = self.embedding_factory.create_embedding_function(self.embedding_config)
+            return embedding_function.embed_query(text)
+        except Exception as e:
+            logger.error(f"创建嵌入向量失败: {str(e)}")
+            raise
+
 class EmbeddingFactory:
     """
     嵌入工厂类，负责创建不同提供商的嵌入函数

@@ -97,6 +97,7 @@ class VectorStoreService:
         初始化向量存储服务
         """
         self.initialized_dbs = {}
+        self.provider = None
         self.chroma_service = None  # 延迟初始化
         self.milvus_alias = "default"
         self.metadata_file = os.path.join(os.path.dirname(__file__), "..", "collection_metadata.json")
@@ -728,79 +729,81 @@ class VectorStoreService:
         except Exception as e:
             logger.warning(f"断开 Milvus 连接时出错: {e}")
 
-    def search(
-        self,
-        query_embedding: List[float],
-        collection_name: str,
-        provider: str,
-        config: VectorDBConfig,
-        top_k: int = 3,
-        threshold: float = 0.7
-    ) -> List[Dict[str, Any]]:
-        """
-        在指定集合中搜索最相似的向量
-        """
+    def search(self, collection_name: str, query_vector: List[float], top_k: int = 3, threshold: float = 0.7) -> Dict:
+        """在指定集合中搜索最相似的向量"""
         try:
-            logger.info(f"在集合 '{collection_name}' 中初始化搜索，提供商 '{provider}'")
-            
-            # 确保连接已建立
-            self._connect_milvus(config)
-            
             # 检查集合是否存在
-            collections = utility.list_collections()
-            if collection_name not in collections:
-                raise ValueError(
-                    f"集合 '{collection_name}' 不存在。\n"
-                    f"可用的集合有: {collections}\n"
-                    "请确保：\n"
-                    "1. 集合名称输入正确\n"
-                    "2. 已经完成文档的索引过程\n"
-                    "3. Milvus Lite 数据库文件未被删除或损坏"
-                )
+            if not self._check_collection_exists(collection_name):
+                raise ValueError(f"集合 {collection_name} 不存在")
             
-            try:
-                collection = Collection(name=collection_name, using=self.milvus_alias)
-                collection.load()
-                
-                search_params = {
-                    "metric_type": "L2",
-                    "params": {"nprobe": 10}
+            # 执行搜索
+            search_params = {
+                "metric_type": "L2",
+                "params": {"nprobe": 10}
+            }
+            
+            # 连接到Milvus
+            self._connect_milvus(VectorDBConfig(provider="milvus", index_mode="flat"))
+            
+            # 获取集合
+            collection = Collection(name=collection_name, using=self.milvus_alias)
+            collection.load()
+            
+            # 执行搜索
+            results = collection.search(
+                data=[query_vector],
+                anns_field="vector",
+                param=search_params,
+                limit=top_k,
+                output_fields=["content", "document_name", "chunk_id", "page_number", "word_count"]
+            )
+            
+            # 处理搜索结果
+            hits = []
+            for hit in results[0]:
+                if hit.score <= threshold:
+                    continue
+                    
+                # 获取实体数据
+                try:
+                    # 直接访问实体字段
+                    content = hit.entity.content
+                    document_name = hit.entity.document_name
+                    chunk_id = hit.entity.chunk_id
+                    page_number = hit.entity.page_number
+                    word_count = hit.entity.word_count
+                    
+                    metadata = {
+                        "document_name": document_name,
+                        "chunk_id": chunk_id,
+                        "page_number": page_number,
+                        "word_count": word_count
+                    }
+                    
+                    hits.append({
+                        "content": content,
+                        "metadata": metadata,
+                        "score": float(hit.score)
+                    })
+                except Exception as e:
+                    logger.warning(f"处理搜索结果时出错: {e}")
+                    continue
+            
+            return {
+                "status": "success",
+                "message": f"在集合 {collection_name} 中找到 {len(hits)} 个匹配结果",
+                "details": {
+                    "collection_name": collection_name,
+                    "total_hits": len(hits),
+                    "hits": hits
                 }
-                
-                logger.info(f"使用参数执行搜索: {search_params}")
-                results = collection.search(
-                    data=[query_embedding],
-                    anns_field="vector",
-                    param=search_params,
-                    limit=top_k,
-                    output_fields=["content", "document_name", "chunk_id", "page_number", "word_count"]
-                )
-                
-                search_results = []
-                for hits in results:
-                    for hit in hits:
-                        if hit.score <= threshold:  # 对于L2距离，较小的值表示更相似
-                            search_results.append({
-                                "content": hit.entity.get("content", ""),
-                                "score": 1 - hit.score,  # 转换分数为相似度
-                                "metadata": {
-                                    "document_name": hit.entity.get("document_name", ""),
-                                    "chunk_id": hit.entity.get("chunk_id", -1),
-                                    "page_number": hit.entity.get("page_number", -1),
-                                    "word_count": hit.entity.get("word_count", 0)
-                                }
-                            })
-                
-                return search_results
-                
-            finally:
-                if 'collection' in locals():
-                    collection.release()
-                
+            }
         except Exception as e:
             logger.error(f"搜索操作出错: {e}")
             raise
         finally:
+            if 'collection' in locals():
+                collection.release()
             self._disconnect_milvus()
 
     def _check_and_init_db(self):
@@ -879,4 +882,26 @@ class VectorStoreService:
             return True
         except Exception as e:
             logger.error(f"验证索引时出错: {e}", exc_info=True)
+            return False
+
+    def _check_collection_exists(self, collection_name: str) -> bool:
+        """
+        检查集合是否存在
+        
+        参数:
+            collection_name: 集合名称
+            
+        返回:
+            bool: 集合是否存在
+        """
+        try:
+            # 连接到Milvus
+            self._connect_milvus(VectorDBConfig(provider="milvus", index_mode="flat"))
+            
+            # 检查集合是否存在
+            exists = utility.has_collection(collection_name, using=self.milvus_alias)
+            logger.info(f"集合 {collection_name} 存在: {exists}")
+            return exists
+        except Exception as e:
+            logger.error(f"检查集合是否存在时出错: {e}")
             return False

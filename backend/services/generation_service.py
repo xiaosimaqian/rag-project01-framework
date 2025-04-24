@@ -305,11 +305,29 @@ class GenerationService:
             包含生成回答和保存路径的字典
         """
         try:
+            # 验证输入参数
+            if not provider or not model_name:
+                raise ValueError("Provider and model_name are required")
+            if not query:
+                raise ValueError("Query is required")
+            if not search_results:
+                raise ValueError("Search results are required")
+                
+            # 验证提供商是否支持
+            if provider not in self.models:
+                raise ValueError(f"Unsupported provider: {provider}")
+                
+            # 验证模型是否支持
+            if model_name not in self.models[provider]:
+                raise ValueError(f"Unsupported model: {model_name} for provider: {provider}")
+            
             # 准备上下文
             context = "\n\n".join([
-                f"[Source {i+1}]: {result['text']}"
+                f"[Source {i+1}]: {result.get('text', result.get('content', ''))}"
                 for i, result in enumerate(search_results)
             ])
+            
+            logger.info(f"Generating response with provider: {provider}, model: {model_name}")
             
             # 根据不同提供商生成回答
             if provider == "huggingface":
@@ -319,9 +337,13 @@ class GenerationService:
             elif provider == "deepseek":
                 response = self._generate_with_deepseek(model_name, query, context, api_key, show_reasoning)
             elif provider == "ollama":
-                response = self._generate_with_ollama(model_name, query, context,show_reasoning)
+                response = self._generate_with_ollama(model_name, query, context, show_reasoning)
             else:
                 raise ValueError(f"Unsupported provider: {provider}")
+                
+            # 验证响应
+            if not isinstance(response, str):
+                raise TypeError(f"Expected string response, got {type(response)}")
                 
             # 准备保存的结果
             result = {
@@ -347,7 +369,7 @@ class GenerationService:
             }
             
         except Exception as e:
-            logger.error(f"Error in generation: {str(e)}")
+            logger.error(f"Error in generation: {str(e)}", exc_info=True)
             raise
 
     def get_available_models(self) -> Dict:

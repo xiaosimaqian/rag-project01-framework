@@ -41,62 +41,39 @@ class SearchService:
         query: str,
         collection_name: str,
         provider: str,
+        config: VectorDBConfig,
         top_k: int = 3,
-        threshold: float = 0.7,
-        word_count_threshold: int = 100
-    ) -> List[Dict[str, Any]]:
-        """
-        执行相似度搜索
-        """
+        threshold: float = 0.7
+    ) -> Dict:
+        """执行搜索操作"""
         try:
             logger.info(f"开始搜索，提供商: {provider}, 集合: {collection_name}")
             
             # 获取原始文档使用的嵌入配置
             embedding_config = self.embedding_service.get_document_embedding_config(collection_name)
             
-            # 创建向量数据库配置
-            vector_db_config = VectorDBConfig(
-                provider=provider,
-                index_mode="flat"  # 使用默认的 flat 索引模式进行搜索
-            )
-            
-            # 验证配置
-            if not vector_db_config.uri:
-                raise ValueError(f"向量数据库 URI 配置不正确，提供商: {provider}")
-            
-            logger.info(f"使用向量数据库配置: {vector_db_config.__dict__}")
-            
             # 生成查询向量
             logger.info(f"使用 {embedding_config.provider} - {embedding_config.model_name} 生成查询向量")
-            query_embedding = await self.embedding_service.create_single_embedding(
+            query_vector = await self.embedding_service.create_single_embedding(
                 text=query,
                 config=embedding_config
             )
             
+            if not query_vector:
+                raise ValueError("无法生成查询向量")
+            
             # 执行向量搜索
-            logger.info(f"在集合 {collection_name} 中执行向量搜索")
             results = self.vector_store_service.search(
-                query_embedding=query_embedding,
                 collection_name=collection_name,
-                provider=provider,
-                config=vector_db_config,
+                query_vector=query_vector,
                 top_k=top_k,
                 threshold=threshold
             )
             
-            # 过滤结果
-            if word_count_threshold > 0:
-                filtered_results = [
-                    r for r in results 
-                    if r["metadata"].get("word_count", 0) >= word_count_threshold
-                ]
-                logger.info(f"基于词数阈值过滤结果，从 {len(results)} 减少到 {len(filtered_results)}")
-                results = filtered_results
-            
             return results
             
         except Exception as e:
-            logger.error(f"搜索操作出错: {e}", exc_info=True)
+            logger.error(f"搜索操作出错: {e}")
             raise
 
     def get_providers(self) -> List[Dict[str, str]]:
