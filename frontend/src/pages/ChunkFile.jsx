@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import RandomImage from '../components/RandomImage';
 import { apiBaseUrl } from '../config/config';
 
@@ -12,6 +12,27 @@ const ChunkFile = () => {
   const [activeTab, setActiveTab] = useState('chunks');
   const [processingStatus, setProcessingStatus] = useState('');
   const [chunkedDocuments, setChunkedDocuments] = useState([]);
+  const [isLoading, setIsLoading] = useState(false);
+
+  // 使用useMemo优化chunks的渲染
+  const renderedChunks = useMemo(() => {
+    if (!chunks || !Array.isArray(chunks.chunks)) return null;
+    
+    return chunks.chunks.map((chunk) => (
+      <div key={chunk.metadata.chunk_id} className="p-3 border rounded bg-gray-50">
+        <div className="font-medium text-sm text-gray-500 mb-1">
+          Chunk {chunk.metadata.chunk_id}
+        </div>
+        <div className="text-xs text-gray-400 mb-2">
+          Page(s): {chunk.metadata.page_range} | 
+          Words: {chunk.metadata.word_count}
+        </div>
+        <div className="text-sm mt-2">
+          <div className="text-gray-600">{chunk.content}</div>
+        </div>
+      </div>
+    ));
+  }, [chunks]);
 
   useEffect(() => {
     fetchLoadedDocuments();
@@ -28,7 +49,6 @@ const ChunkFile = () => {
         throw new Error(`HTTP error! status: ${chunkedResponse.status}`);
       }
       const chunkedData = await chunkedResponse.json();
-      console.log('Chunked documents response:', chunkedData);
       
       if (!chunkedData.documents || !Array.isArray(chunkedData.documents)) {
         console.error('Invalid chunked documents data:', chunkedData);
@@ -44,7 +64,6 @@ const ChunkFile = () => {
               return doc;
             }
             const detailData = await detailResponse.json();
-            console.log(`Details for ${doc.name}:`, detailData);
             
             return {
               ...doc,
@@ -60,7 +79,6 @@ const ChunkFile = () => {
         })
       );
       
-      console.log('Final chunked documents:', chunkedDocsWithDetails);
       setChunkedDocuments(chunkedDocsWithDetails);
     } catch (error) {
       console.error('Error fetching documents:', error);
@@ -70,55 +88,55 @@ const ChunkFile = () => {
 
   const handleChunk = async () => {
     if (!selectedDoc || !chunkingOption) {
-      setStatus('Please select a document and chunking option');
+      setProcessingStatus('请选择文档和分块选项');
       return;
     }
 
-    setStatus('Processing...');
-    setChunks(null);
+    setIsLoading(true);
+    setProcessingStatus('处理中...');
+    console.log('开始分块处理:', {
+      doc_id: selectedDoc,
+      chunking_option: chunkingOption,
+      chunk_size: chunkSize,
+      doc_type: 'parsed'
+    });
 
     try {
-      const docId = selectedDoc.endsWith('.json') ? selectedDoc : `${selectedDoc}.json`;
-      
-      const selectedDocument = loadedDocuments.find(doc => doc.name === selectedDoc);
-      const docType = selectedDocument?.type || 'loaded';
-      
       const response = await fetch(`${apiBaseUrl}/chunk`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          doc_id: docId,
+          doc_id: selectedDoc,
           chunking_option: chunkingOption,
           chunk_size: chunkSize,
-          doc_type: docType
+          doc_type: 'parsed'
         }),
       });
 
+      console.log('服务器响应状态:', response.status);
+      
       if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+        const errorData = await response.json();
+        console.error('服务器错误:', errorData);
+        throw new Error(errorData.detail || `HTTP error! status: ${response.status}`);
       }
 
       const data = await response.json();
-      console.log('Chunk response:', data);
-
-      setChunks({
-        filename: data.filename,
-        total_pages: data.total_pages,
-        total_chunks: data.total_chunks,
-        loading_method: data.loading_method,
-        chunking_method: data.chunking_method,
-        timestamp: data.timestamp,
-        chunks: data.chunks
-      });
-
-      setStatus('Chunking completed successfully!');
+      console.log('分块结果:', data);
+      
+      setChunks(data);
+      setProcessingStatus('分块完成!');
+      setActiveTab('chunks');
+      
+      // 刷新文档列表
       fetchLoadedDocuments();
-
     } catch (error) {
-      console.error('Error:', error);
-      setStatus(`Error: ${error.message}`);
+      console.error('分块处理错误:', error);
+      setProcessingStatus(`错误: ${error.message}`);
+    } finally {
+      setIsLoading(false);
     }
   };
 
@@ -200,20 +218,7 @@ const ChunkFile = () => {
                 </div>
               </div>
               <div className="space-y-3 max-h-[calc(100vh-300px)] overflow-y-auto">
-                {Array.isArray(chunks.chunks) && chunks.chunks.map((chunk) => (
-                  <div key={chunk.metadata.chunk_id} className="p-3 border rounded bg-gray-50">
-                    <div className="font-medium text-sm text-gray-500 mb-1">
-                      Chunk {chunk.metadata.chunk_id}
-                    </div>
-                    <div className="text-xs text-gray-400 mb-2">
-                      Page(s): {chunk.metadata.page_range} | 
-                      Words: {chunk.metadata.word_count}
-                    </div>
-                    <div className="text-sm mt-2">
-                      <div className="text-gray-600">{chunk.content}</div>
-                    </div>
-                  </div>
-                ))}
+                {renderedChunks}
               </div>
             </div>
           ) : (
@@ -279,6 +284,7 @@ const ChunkFile = () => {
                 value={selectedDoc}
                 onChange={(e) => setSelectedDoc(e.target.value)}
                 className="block w-full p-2 border rounded"
+                disabled={isLoading}
               >
                 <option value="">Choose a document...</option>
                 {loadedDocuments.map((doc) => (
@@ -295,11 +301,13 @@ const ChunkFile = () => {
                 value={chunkingOption}
                 onChange={(e) => setChunkingOption(e.target.value)}
                 className="block w-full p-2 border rounded"
+                disabled={isLoading}
               >
                 <option value="by_pages">By Pages</option>
                 <option value="fixed_size">Fixed Size</option>
                 <option value="by_paragraphs">By Paragraphs</option>
                 <option value="by_sentences">By Sentences</option>
+                <option value="by_semicolons">By Semicolons (Verilog)</option>
               </select>
             </div>
 
@@ -313,24 +321,38 @@ const ChunkFile = () => {
                   className="block w-full p-2 border rounded"
                   min="100"
                   max="5000"
+                  disabled={isLoading}
                 />
+              </div>
+            )}
+
+            {chunkingOption === 'by_semicolons' && (
+              <div className="mb-4">
+                <label className="block text-sm font-medium mb-1">Verilog File Options</label>
+                <div className="text-sm text-gray-600">
+                  <p>This option will split Verilog files by semicolons, preserving module definitions and statements.</p>
+                </div>
               </div>
             )}
 
             <button 
               onClick={handleChunk}
-              className="w-full px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
-              disabled={!selectedDoc}
+              className={`w-full px-4 py-2 text-white rounded ${
+                isLoading 
+                  ? 'bg-gray-400 cursor-not-allowed' 
+                  : 'bg-blue-500 hover:bg-blue-600'
+              }`}
+              disabled={!selectedDoc || isLoading}
             >
-              Create Chunks
+              {isLoading ? 'Processing...' : 'Create Chunks'}
             </button>
           </div>
 
-          {status && (
+          {processingStatus && (
             <div className={`p-4 rounded-lg ${
-              status.includes('Error') ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'
+              processingStatus.includes('Error') ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'
             }`}>
-              {status}
+              {processingStatus}
             </div>
           )}
         </div>

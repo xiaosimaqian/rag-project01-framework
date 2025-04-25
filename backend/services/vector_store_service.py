@@ -334,158 +334,146 @@ class VectorStoreService:
             logger.error(f"加载嵌入向量时出错: {str(e)}", exc_info=True)
             raise
     
-    def _index_to_milvus(self, embeddings_data: dict, collection_name: str, index_mode: str = "flat") -> dict:
-        """索引到Milvus数据库"""
+    def _index_to_milvus(self, embeddings_data, collection_name, index_mode):
+        """将嵌入数据索引到 Milvus"""
         try:
-            # 记录输入数据的结构
-            logger.info(f"Received embeddings_data keys: {embeddings_data.keys()}")
+            # 确保断开所有现有连接
+            try:
+                connections.disconnect("default")
+            except Exception as e:
+                logger.warning(f"断开现有连接时出错: {str(e)}")
             
-            # 从embeddings_data中获取必要信息
-            embeddings = embeddings_data.get("embeddings", [])
-            metadata = embeddings_data.get("metadata", {})
+            # 配置 Milvus 客户端
+            connections.connect(
+                alias="default",
+                uri=MILVUS_CONFIG["uri"],  # 使用 URI 而不是 host:port
+                user=MILVUS_CONFIG.get("user", ""),
+                password=MILVUS_CONFIG.get("password", ""),
+                db_name=MILVUS_CONFIG.get("db_name", "default"),
+                # 增加消息大小限制
+                grpc_max_send_message_length=1024 * 1024 * 1024,  # 1GB
+                grpc_max_receive_message_length=1024 * 1024 * 1024  # 1GB
+            )
             
-            logger.info(f"Number of embeddings: {len(embeddings)}")
-            logger.info(f"Metadata: {metadata}")
+            # 获取集合
+            collection = Collection(collection_name)
             
-            if not embeddings:
-                raise ValueError("没有可用的嵌入向量数据")
-            
-            # 从metadata中获取向量维度
-            vector_dimension = metadata.get("vector_dimension", 1024)
-            logger.info(f"Vector dimension from metadata: {vector_dimension}")
-            
-            # 检查目标集合是否存在
-            collection_exists = utility.has_collection(collection_name, using=self.milvus_alias)
-            logger.info(f"Collection {collection_name} exists: {collection_exists}")
-            
-            # 如果集合不存在，创建新集合
-            if not collection_exists:
-                # 定义集合的schema
-                fields = [
-                    FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
-                    FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=vector_dimension),
-                    FieldSchema(name="content", dtype=DataType.VARCHAR, max_length=65535),
-                    FieldSchema(name="document_name", dtype=DataType.VARCHAR, max_length=256),
-                    FieldSchema(name="chunk_id", dtype=DataType.VARCHAR, max_length=256),
-                    FieldSchema(name="page_number", dtype=DataType.INT64),
-                    FieldSchema(name="word_count", dtype=DataType.INT64)
-                ]
-                schema = CollectionSchema(fields=fields, description=f"Collection for {collection_name}")
-                
-                # 使用Collection类创建集合
-                collection = Collection(name=collection_name, schema=schema, using=self.milvus_alias)
-                logger.info(f"Created new collection: {collection_name}")
-            else:
-                collection = Collection(name=collection_name, using=self.milvus_alias)
-                # 获取现有集合的schema
-                schema = collection.schema
-                # 验证向量维度是否匹配
-                for field in schema.fields:
-                    if field.name == "vector":
-                        if field.dim != vector_dimension:
-                            raise ValueError(f"向量维度不匹配：现有集合维度为 {field.dim}，新数据维度为 {vector_dimension}")
+            # 获取集合的 schema
+            schema = collection.schema
+            logger.info(f"集合 schema: {schema}")
             
             # 准备数据
             vectors = []
             texts = []
-            metadata_list = []
+            document_names = []
+            chunk_ids = []
+            page_numbers = []
+            word_counts = []
             
-            # 从embeddings_data中提取数据
-            for i, embedding in enumerate(embeddings):
-                # 确保向量数据存在
-                vector = embedding.get("embedding", [])
-                if not vector:
-                    logger.warning(f"Skipping embedding {i} due to missing vector data")
+            # 从 embeddings_data 中提取数据
+            if isinstance(embeddings_data, dict) and "embeddings" in embeddings_data:
+                embeddings = embeddings_data["embeddings"]
+            else:
+                embeddings = embeddings_data
+            
+            for embedding in embeddings:
+                if not isinstance(embedding, dict):
+                    logger.warning(f"跳过无效的嵌入数据: {type(embedding)}")
                     continue
                     
-                # 确保文本内容存在
-                text = embedding.get("metadata", {}).get("content", "")
-                if not text:
-                    logger.warning(f"Skipping embedding {i} due to missing text content")
+                vector = embedding.get("embedding")
+                if not vector:
+                    logger.warning("跳过缺少向量数据的嵌入")
                     continue
-                
+                    
+                metadata = embedding.get("metadata", {})
                 vectors.append(vector)
-                texts.append(text)
-                
-                # 确保所有元数据字段都有默认值
-                metadata_list.append({
-                    "document_name": embedding.get("metadata", {}).get("document_name", metadata.get("document_name", "unknown")),
-                    "chunk_id": str(embedding.get("metadata", {}).get("chunk_id", f"chunk_{i}")),  # 确保是字符串
-                    "page_number": int(embedding.get("metadata", {}).get("page_number", 0) or 0),  # 处理None值
-                    "word_count": int(embedding.get("metadata", {}).get("word_count", len(text.split())) or 0)  # 处理None值
-                })
+                texts.append(metadata.get("content", "")[:1000])  # 限制内容长度
+                document_names.append(metadata.get("document_name", ""))
+                chunk_ids.append(str(metadata.get("chunk_id", "")))  # 确保是字符串
+                page_numbers.append(int(metadata.get("page_number", 0) or 0))  # 处理 None 值
+                word_counts.append(int(metadata.get("word_count", 0) or 0))  # 处理 None 值
             
             if not vectors:
                 raise ValueError("没有有效的向量数据可以插入")
+            
+            # 分批处理
+            batch_size = 1000
+            total_vectors = len(vectors)
+            inserted_count = 0
+            
+            logger.info(f"开始分批插入向量,总数: {total_vectors}")
+            
+            for i in range(0, total_vectors, batch_size):
+                batch_vectors = vectors[i:i + batch_size]
+                batch_texts = texts[i:i + batch_size]
+                batch_document_names = document_names[i:i + batch_size]
+                batch_chunk_ids = chunk_ids[i:i + batch_size]
+                batch_page_numbers = page_numbers[i:i + batch_size]
+                batch_word_counts = word_counts[i:i + batch_size]
                 
-            logger.info(f"Prepared {len(vectors)} vectors for insertion")
-            logger.info(f"First vector sample: {vectors[0][:5] if vectors else 'No vectors'}")
-            
-            # 插入数据到集合
-            insert_result = collection.insert([
-                vectors,  # 向量数据
-                texts,   # 文本内容
-                [m["document_name"] for m in metadata_list],  # 文档名称
-                [m["chunk_id"] for m in metadata_list],       # 块ID
-                [m["page_number"] for m in metadata_list],    # 页码
-                [m["word_count"] for m in metadata_list]      # 词数
-            ])
-            
-            logger.info(f"Insert result: {insert_result}")
-            
+                try:
+                    # 插入当前批次
+                    insert_result = collection.insert([
+                        batch_vectors,
+                        batch_texts,
+                        batch_document_names,
+                        batch_chunk_ids,
+                        batch_page_numbers,
+                        batch_word_counts
+                    ])
+                    inserted_count += len(batch_vectors)
+                    logger.info(f"成功插入第 {i//batch_size + 1} 批, 当前进度: {inserted_count}/{total_vectors}")
+                    
+                except Exception as e:
+                    logger.error(f"插入第 {i//batch_size + 1} 批时出错: {str(e)}")
+                    raise
+                
             # 创建索引
-            index_params = {
-                "metric_type": "L2",
-                "index_type": MILVUS_CONFIG["index_types"].get(index_mode, "FLAT")
-            }
-            logger.info(f"Creating index with params: {index_params}")
-            collection.create_index(field_name="vector", index_params=index_params)
+            if index_mode == "HNSW":
+                # Milvus Lite 不支持 HNSW，使用 IVF_FLAT 替代
+                index_params = {
+                    "metric_type": "L2",
+                    "index_type": "IVF_FLAT",
+                    "params": {"nlist": 1024}  # 根据数据量调整 nlist
+                }
+            else:  # 默认使用 FLAT
+                index_params = {
+                    "metric_type": "L2",
+                    "index_type": "FLAT"
+                }
+                
+            collection.create_index(
+                field_name="vector",
+                index_params=index_params
+            )
             
-            # 获取集合信息
-            collection_info = collection.describe()
-            num_entities = collection.num_entities
-            logger.info(f"Collection info after insertion: {collection_info}")
-            logger.info(f"Number of entities: {num_entities}")
+            # 加载集合到内存
+            collection.load()
             
-            # 保存集合元数据
-            collection_metadata = {
-                "dimension": vector_dimension,
-                "index_type": index_params["index_type"],
-                "metric_type": index_params["metric_type"],
-                "creation_time": datetime.now().isoformat(),
-                "embedding_model": metadata.get("embedding_model", ""),
-                "source_file": metadata.get("document_name", ""),
-                "total_vectors": len(vectors)
-            }
-            self._save_collection_metadata(collection_name, collection_metadata)
+            logger.info(f"成功完成向量索引,共插入 {inserted_count} 个向量")
             
-            # 返回结果
-            result = {
+            return {
                 "status": "success",
-                "message": "索引完成",
+                "message": f"成功索引 {inserted_count} 个向量到集合 {collection_name}",
                 "details": {
-                    "database": "milvus",
+                    "total_vectors": inserted_count,
                     "collection_name": collection_name,
-                    "index_mode": index_mode,
-                    "action": "create" if not collection_exists else "append",
-                    "total_vectors": len(vectors),
-                    "total_entities": len(vectors),
-                    "processing_time": 0,
-                    "index_size": 0,
-                    "index_type": index_params["index_type"],
-                    "metric_type": index_params["metric_type"],
-                    "index_params": index_params,
-                    "dimension": vector_dimension,
-                    "creation_time": collection_metadata["creation_time"]
+                    "index_mode": index_params["index_type"]  # 返回实际使用的索引类型
                 }
             }
             
-            logger.info(f"Returning result: {json.dumps(result, indent=2)}")
-            return result
-            
         except Exception as e:
-            logger.error(f"索引到Milvus失败: {str(e)}", exc_info=True)
+            logger.error(f"索引到Milvus失败: {str(e)}")
             raise ValueError(f"索引到Milvus失败: {str(e)}")
+            
+        finally:
+            # 断开连接
+            try:
+                connections.disconnect("default")
+                logger.info("已断开 Milvus 连接")
+            except Exception as e:
+                logger.warning(f"断开 Milvus 连接时出错: {str(e)}")
 
     def list_collections(self, provider: str = "milvus") -> List[Dict[str, Any]]:
         """

@@ -198,66 +198,100 @@ async def list_documents():
 async def embed_document(
     data: dict = Body(...)
 ):
-    """为文档创建嵌入向量"""
     try:
-        # 从请求中获取参数
-        document_id = data.get("documentId")
-        embedding_provider = data.get("embeddingProvider", "ollama")
-        embedding_model = data.get("embeddingModel", "bge-m3:latest")
+        doc_name = data.get("docName")
+        doc_type = data.get("docType", "chunked")  # 默认为 chunked 类型
+        embedding_config = data.get("embeddingConfig", {})
         
-        if not document_id:
-            raise ValueError("Missing documentId")
+        if not doc_name:
+            raise ValueError("文档名称不能为空")
             
-        # 构建文件路径 - 从 chunked-docs 目录读取
-        chunked_file_path = os.path.join("01-chunked-docs", document_id)
-        if not os.path.exists(chunked_file_path):
-            raise FileNotFoundError(f"Document not found: {chunked_file_path}")
-            
-        # 读取分块后的文档
-        with open(chunked_file_path, 'r', encoding='utf-8') as f:
-            chunked_data = json.load(f)
-            
-        # 准备元数据
-        metadata = {
-            "document_name": os.path.splitext(document_id)[0],
-            "embedding_provider": embedding_provider,
-            "embedding_model": embedding_model,
-            "created_at": datetime.now().isoformat()
-        }
+        # 使用绝对路径
+        chunked_dir = os.path.join(BASE_DIR, "01-chunked-docs")
+        file_path = os.path.join(chunked_dir, f"{doc_name}.json")
         
-        # 如果分块数据中有元数据，则合并
-        if "metadata" in chunked_data:
-            metadata.update(chunked_data["metadata"])
+        # 如果文件不存在，尝试查找解析后的文件
+        if not os.path.exists(file_path):
+            # 查找以 "parsed_" 开头且以 ".json" 结尾的文件
+            for filename in os.listdir(chunked_dir):
+                if filename.startswith(f"parsed_{doc_name}") and filename.endswith(".json"):
+                    file_path = os.path.join(chunked_dir, filename)
+                    break
+                    
+        if not os.path.exists(file_path):
+            # 记录更多信息以便调试
+            logger.error(f"找不到文档，搜索路径: {file_path}")
+            logger.error(f"目录内容: {os.listdir(chunked_dir)}")
+            raise HTTPException(
+                status_code=404,
+                detail=f"找不到文档: {doc_name}"
+            )
+            
+        # 读取文档内容
+        with open(file_path, 'r', encoding='utf-8') as f:
+            doc_data = json.load(f)
+            
+        # 准备元数据和文本块
+        metadata = doc_data.get("metadata", {})
+        chunks = []
         
+        # 根据文档格式处理文本块
+        if "chunks" in doc_data:
+            # 标准格式
+            chunks = doc_data["chunks"]
+        elif "content" in doc_data:
+            # parsed 格式
+            chunks = [
+                {
+                    "content": item["content"],
+                    "metadata": {
+                        "chunk_id": idx + 1,
+                        "page_number": item.get("page", 0),
+                        "page_range": str(item.get("page", 0)),
+                        "word_count": len(item["content"].split())
+                    }
+                }
+                for idx, item in enumerate(doc_data["content"])
+            ]
+        
+        if not chunks:
+            raise ValueError("文档没有可用的文本块")
+            
         # 创建嵌入配置
         embedding_config = EmbeddingConfig(
-            provider=embedding_provider,
-            model_name=embedding_model
+            provider=embedding_config.get("provider", "ollama"),
+            model_name=embedding_config.get("model", "bge-m3:latest")
         )
         
         # 创建嵌入
         embedding_service = EmbeddingService()
-        embeddings = embedding_service.create_embeddings(
-            chunks=chunked_data["chunks"],
-            metadata=metadata
+        embeddings = await embedding_service.create_embeddings(
+            chunks=chunks,
+            metadata=metadata,
+            doc_timestamp=datetime.now().strftime("%Y%m%d%H%M%S")
         )
         
-        # 保存嵌入向量
-        doc_name = os.path.splitext(document_id)[0]  # 移除 .json 后缀
-        filepath = embedding_service.save_embeddings(doc_name, embeddings)
+        # 保存嵌入结果
+        output_dir = os.path.join(BASE_DIR, "02-embedded-docs")
+        os.makedirs(output_dir, exist_ok=True)
         
+        output_path = os.path.join(
+            output_dir,
+            f"{doc_name}_embeddings.json"
+        )
+        
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(embeddings, f, ensure_ascii=False, indent=2)
+            
         return {
             "status": "success",
-            "message": "Embedding completed successfully",
-            "filepath": filepath,
-            "embeddings": embeddings["embeddings"],  # 只返回嵌入向量部分
-            "documentId": document_id,
-            "embeddingProvider": embedding_provider,
-            "embeddingModel": embedding_model
+            "message": f"成功为文档 {doc_name} 创建嵌入",
+            "filepath": output_path,
+            "embeddings": embeddings
         }
         
     except Exception as e:
-        logger.error(f"Error creating embeddings: {str(e)}", exc_info=True)
+        logger.error(f"创建嵌入时出错: {str(e)}")
         raise HTTPException(
             status_code=500,
             detail=str(e)
@@ -488,64 +522,86 @@ async def delete_collection(provider: str, collection_name: str):
 async def get_documents(type: str = Query("all")):
     try:
         documents = []
+        logger.info(f"开始获取文档列表,类型: {type}")
         
         # 读取loaded文档
         if type in ["all", "loaded"]:
             loaded_dir = "01-loaded-docs"
+            logger.info(f"读取loaded文档目录: {loaded_dir}")
             if os.path.exists(loaded_dir):
                 for filename in os.listdir(loaded_dir):
                     if filename.endswith('.json'):
                         file_path = os.path.join(loaded_dir, filename)
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            doc_data = json.load(f)
-                            documents.append({
-                                "id": filename,
-                                "name": filename,
-                                "type": "loaded",
-                                "metadata": {
-                                    "total_pages": doc_data.get("total_pages"),
-                                    "total_chunks": doc_data.get("total_chunks"),
-                                    "loading_method": doc_data.get("loading_method"),
-                                    "chunking_method": doc_data.get("chunking_method"),
-                                    "timestamp": doc_data.get("timestamp")
-                                }
-                            })
+                        try:
+                            with open(file_path, 'r', encoding='utf-8') as f:
+                                doc_data = json.load(f)
+                                documents.append({
+                                    "id": filename,
+                                    "name": filename,
+                                    "type": "loaded",
+                                    "metadata": {
+                                        "total_pages": doc_data.get("total_pages"),
+                                        "total_chunks": doc_data.get("total_chunks"),
+                                        "loading_method": doc_data.get("loading_method"),
+                                        "chunking_method": doc_data.get("chunking_method"),
+                                        "timestamp": doc_data.get("timestamp")
+                                    }
+                                })
+                        except json.JSONDecodeError as e:
+                            logger.error(f"JSON解析错误,文件 {filename}: {str(e)}")
+                            continue
+                        except Exception as e:
+                            logger.error(f"读取loaded文件 {filename} 时出错: {str(e)}")
+                            continue
 
-        # 读取chunked文档
-        if type in ["all", "chunked"]:
+        # 读取chunked文档(包括parsed文件)
+        if type in ["all", "chunked", "parsed"]:
             chunked_dir = "01-chunked-docs"
+            logger.info(f"读取chunked文档目录: {chunked_dir}")
             if os.path.exists(chunked_dir):
                 for filename in os.listdir(chunked_dir):
                     if filename.endswith('.json'):
                         file_path = os.path.join(chunked_dir, filename)
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            doc_data = json.load(f)
-                            documents.append({
-                                "id": filename,
-                                "name": filename,
-                                "type": "chunked"
-                            })
-
-        # 读取parsed文档
-        if type in ["all", "parsed"]:
-            parsed_dir = "01-parsed-docs"
-            if os.path.exists(parsed_dir):
-                for filename in os.listdir(parsed_dir):
-                    if filename.endswith('.json'):
-                        file_path = os.path.join(parsed_dir, filename)
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            doc_data = json.load(f)
-                            documents.append({
-                                "id": filename,
-                                "name": filename,
-                                "type": "parsed",
-                                "metadata": doc_data.get("metadata", {})
-                            })
+                        try:
+                            with open(file_path, 'r', encoding='utf-8') as f:
+                                doc_data = json.load(f)
+                                # 根据文件名判断文档类型
+                                doc_type = "parsed" if filename.startswith("parsed_") else "chunked"
+                                documents.append({
+                                    "id": filename,
+                                    "name": filename,
+                                    "type": doc_type,
+                                    "metadata": {
+                                        "total_pages": doc_data.get("total_pages"),
+                                        "total_chunks": doc_data.get("total_chunks"),
+                                        "chunking_method": doc_data.get("chunking_method"),
+                                        "timestamp": doc_data.get("timestamp")
+                                    }
+                                })
+                        except json.JSONDecodeError as e:
+                            logger.error(f"JSON解析错误,文件 {filename}: {str(e)}")
+                            continue
+                        except Exception as e:
+                            logger.error(f"读取chunked文件 {filename} 时出错: {str(e)}")
+                            continue
+            else:
+                logger.warning(f"目录不存在: {chunked_dir}")
         
+        # 按时间戳排序,最新的在前面
+        def get_timestamp(doc):
+            try:
+                timestamp = doc.get("metadata", {}).get("timestamp", "")
+                return timestamp if timestamp else "1970-01-01T00:00:00"
+            except:
+                return "1970-01-01T00:00:00"
+                
+        documents.sort(key=get_timestamp, reverse=True)
+        
+        logger.info(f"成功获取文档列表,共 {len(documents)} 个文档")
         return {"documents": documents}
     except Exception as e:
-        logger.error(f"Error getting documents: {str(e)}")
-        raise
+        logger.error(f"获取文档列表时出错: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/documents/{doc_name}")
 async def get_document(doc_name: str, type: str = Query("loaded")):
@@ -670,7 +726,8 @@ async def delete_embedded_doc(doc_name: str):
 async def parse_file(
     file: UploadFile = File(...),
     loading_method: str = Form(...),
-    parsing_option: str = Form(...)
+    parsing_option: str = Form(...),
+    file_type: str = Form(...)
 ):
     try:
         # Save uploaded file
@@ -686,16 +743,17 @@ async def parse_file(
             "original_file_size": len(content),
             "processing_date": datetime.now().isoformat(),
             "parsing_method": parsing_option,
+            "file_type": file_type
         }
         
         loading_service = LoadingService()
-        raw_text = loading_service.load_pdf(temp_path, loading_method)
+        raw_text = loading_service.load_document(temp_path, loading_method)
         metadata["total_pages"] = loading_service.get_total_pages()
         
         page_map = loading_service.get_page_map()
         
         parsing_service = ParsingService()
-        parsed_content = parsing_service.parse_pdf(
+        parsed_content = parsing_service.parse_document(
             raw_text, 
             parsing_option, 
             metadata,
@@ -825,11 +883,20 @@ async def chunk_document(data: dict = Body(...)):
             )
         
         # 根据文档类型选择目录
-        directory = "01-loaded-docs" if doc_type == "loaded" else "01-parsed-docs"
+        if doc_type == "loaded":
+            directory = "01-loaded-docs"
+        elif doc_type == "parsed":
+            directory = "01-chunked-docs"  # parsed 文件保存在 chunked-docs 目录
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported document type: {doc_type}"
+            )
+            
         file_path = os.path.join(directory, doc_id)
         
         if not os.path.exists(file_path):
-            raise HTTPException(status_code=404, detail="Document not found")
+            raise HTTPException(status_code=404, detail=f"Document not found at {file_path}")
             
         with open(file_path, 'r', encoding='utf-8') as f:
             doc_data = json.load(f)
@@ -845,13 +912,81 @@ async def chunk_document(data: dict = Body(...)):
                 for chunk in doc_data['chunks']
             ]
         else:  # parsed
-            page_map = [
-                {
-                    'page': item['page'],
-                    'text': item['content']
-                }
-                for item in doc_data['content']
-            ]
+            # 检查是否是Verilog网表文件
+            is_verilog = False
+            if doc_id.endswith('.v'):
+                is_verilog = True
+            elif 'content' in doc_data:
+                content_str = str(doc_data['content'])
+                if 'SYNOPSYS_UNCONNECTED' in content_str or 'module' in content_str or 'endmodule' in content_str:
+                    is_verilog = True
+            
+            if is_verilog:
+                # 对Verilog网表文件进行特殊处理
+                content = doc_data.get('content', [])
+                if isinstance(content, list):
+                    # 将每个模块定义作为一个块
+                    current_module = []
+                    module_count = 0
+                    for item in content:
+                        if isinstance(item, dict):
+                            text = item.get('content', '')
+                            # 按分号分割文本
+                            statements = text.split(';')
+                            for statement in statements:
+                                statement = statement.strip()
+                                if statement:  # 忽略空语句
+                                    # 检查是否是模块定义
+                                    if 'module' in statement or 'endmodule' in statement:
+                                        if current_module:
+                                            page_map.append({
+                                                'page': module_count + 1,
+                                                'text': '\n'.join(current_module)
+                                            })
+                                            module_count += 1
+                                            current_module = []
+                                        current_module.append(statement)
+                                    else:
+                                        current_module.append(statement)
+                    if current_module:
+                        page_map.append({
+                            'page': module_count + 1,
+                            'text': '\n'.join(current_module)
+                        })
+                else:
+                    # 如果不是列表,尝试按行分割
+                    text = str(content)
+                    lines = text.split('\n')
+                    current_chunk = []
+                    chunk_count = 0
+                    for line in lines:
+                        # 按分号分割行
+                        statements = line.split(';')
+                        for statement in statements:
+                            statement = statement.strip()
+                            if statement:  # 忽略空语句
+                                current_chunk.append(statement)
+                                if len(current_chunk) >= chunk_size:
+                                    page_map.append({
+                                        'page': chunk_count + 1,
+                                        'text': '\n'.join(current_chunk)
+                                    })
+                                    chunk_count += 1
+                                    current_chunk = []
+                    if current_chunk:
+                        page_map.append({
+                            'page': chunk_count + 1,
+                            'text': '\n'.join(current_chunk)
+                        })
+            else:
+                # 非Verilog文件的常规处理
+                page_map = [
+                    {
+                        'page': item['page'],
+                        'text': item['content']
+                    }
+                    for item in doc_data['content']
+                ]
             
         # 准备元数据
         metadata = {
@@ -871,7 +1006,12 @@ async def chunk_document(data: dict = Body(...)):
         
         # 生成输出文件名
         timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
-        base_name = os.path.splitext(doc_id)[0].split('_')[0]
+        # 从原始文件名中提取基础名称
+        base_name = os.path.splitext(doc_id)[0]
+        # 如果文件名以parsed_开头,去掉这个前缀
+        if base_name.startswith('parsed_'):
+            base_name = base_name[7:]
+        # 构建新的文件名
         output_filename = f"{base_name}_{chunking_option}_{timestamp}.json"
         
         output_path = os.path.join("01-chunked-docs", output_filename)

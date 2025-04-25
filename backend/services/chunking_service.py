@@ -13,6 +13,7 @@ class ChunkingService:
     - fixed_size: 按固定大小分块
     - by_paragraphs: 按段落分块
     - by_sentences: 按句子分块
+    - by_semicolons: 按分号分块(Verilog文件)
     """
     
     def chunk_text(self, text: str, method: str, metadata: dict, page_map: list = None, chunk_size: int = 1000) -> dict:
@@ -21,7 +22,7 @@ class ChunkingService:
         
         Args:
             text: 原始文本内容
-            method: 分块方法，支持 'by_pages', 'fixed_size', 'by_paragraphs', 'by_sentences'
+            method: 分块方法，支持 'by_pages', 'fixed_size', 'by_paragraphs', 'by_sentences', 'by_semicolons'
             metadata: 文档元数据
             page_map: 页面映射列表，每个元素包含页码和页面文本
             chunk_size: 固定大小分块时的块大小
@@ -74,6 +75,22 @@ class ChunkingService:
                 splitter_method = self._paragraph_chunks if method == "by_paragraphs" else self._sentence_chunks
                 for page_data in page_map:
                     page_chunks = splitter_method(page_data['text'])
+                    for chunk in page_chunks:
+                        chunk_metadata = {
+                            "chunk_id": len(chunks) + 1,
+                            "page_number": page_data['page'],
+                            "page_range": str(page_data['page']),
+                            "word_count": len(chunk["text"].split())
+                        }
+                        chunks.append({
+                            "content": chunk["text"],
+                            "metadata": chunk_metadata
+                        })
+            
+            elif method == "by_semicolons":
+                # 对Verilog文件按分号分块
+                for page_data in page_map:
+                    page_chunks = self._verilog_chunks(page_data['text'])
                     for chunk in page_chunks:
                         chunk_metadata = {
                             "chunk_id": len(chunks) + 1,
@@ -165,3 +182,38 @@ class ChunkingService:
         )
         texts = splitter.split_text(text)
         return [{"text": t} for t in texts]
+
+    def _verilog_chunks(self, text: str) -> list[dict]:
+        """
+        将Verilog文本按分号分块
+        
+        Args:
+            text: 要分块的Verilog文本
+            
+        Returns:
+            分块后的文本列表
+        """
+        chunks = []
+        # 按分号分割文本
+        statements = text.split(';')
+        current_module = []
+        
+        for statement in statements:
+            statement = statement.strip()
+            if not statement:  # 忽略空语句
+                continue
+                
+            # 检查是否是模块定义
+            if 'module' in statement or 'endmodule' in statement:
+                if current_module:
+                    chunks.append({"text": ';'.join(current_module) + ';'})
+                    current_module = []
+                current_module.append(statement)
+            else:
+                current_module.append(statement)
+                
+        # 处理最后一个模块
+        if current_module:
+            chunks.append({"text": ';'.join(current_module) + ';'})
+            
+        return chunks

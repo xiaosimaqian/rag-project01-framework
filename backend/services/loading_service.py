@@ -37,6 +37,36 @@ class LoadingService:
         self.total_pages = 0
         self.current_page_map = []
     
+    def load_document(self, file_path: str, loading_method: str = "pdf", **kwargs) -> str:
+        """
+        加载文档内容
+        
+        参数:
+            file_path: 文件路径
+            loading_method: 加载方法
+            **kwargs: 其他参数
+            
+        返回:
+            文档内容
+        """
+        try:
+            file_ext = os.path.splitext(file_path)[1].lower()
+            
+            if file_ext == '.pdf':
+                return self.load_pdf(file_path, loading_method, **kwargs)
+            elif file_ext in ['.v', '.sp', '.spice']:
+                return self.load_netlist(file_path)
+            elif file_ext == '.lef':
+                return self.load_lef(file_path)
+            elif file_ext == '.lib':
+                return self.load_lib(file_path)
+            else:
+                raise ValueError(f"Unsupported file format: {file_ext}")
+                
+        except Exception as e:
+            logger.error(f"Error loading document: {str(e)}")
+            raise
+    
     def load_pdf(self, file_path: str, method: str, strategy: str = None, chunking_strategy: str = None, chunking_options: dict = None) -> str:
         """
         加载PDF文档的主方法，支持多种加载策略。
@@ -311,4 +341,179 @@ class LoadingService:
             
         except Exception as e:
             logger.error(f"Error saving document: {str(e)}")
+            raise
+
+    def load_netlist(self, file_path: str) -> str:
+        """
+        加载 Netlist 文件
+        
+        参数:
+            file_path: 文件路径
+            
+        返回:
+            Netlist 内容
+        """
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+                
+            # 将 Netlist 内容按模块分块
+            modules = []
+            current_module = []
+            
+            for line in content.split('\n'):
+                line = line.strip()
+                if not line or line.startswith('*'):  # 跳过空行和注释
+                    continue
+                    
+                if line.startswith('.SUBCKT') or line.startswith('.module'):
+                    if current_module:
+                        modules.append('\n'.join(current_module))
+                    current_module = [line]
+                else:
+                    current_module.append(line)
+                    
+            if current_module:
+                modules.append('\n'.join(current_module))
+                
+            # 创建页面映射
+            self.current_page_map = [
+                {
+                    'page': i + 1,
+                    'text': module,
+                    'metadata': {
+                        'type': 'module',
+                        'name': module.split()[1] if len(module.split()) > 1 else f'Module_{i+1}'
+                    }
+                }
+                for i, module in enumerate(modules)
+            ]
+            
+            self.total_pages = len(self.current_page_map)
+            return content
+            
+        except Exception as e:
+            logger.error(f"Error loading netlist: {str(e)}")
+            raise
+            
+    def load_lef(self, file_path: str) -> str:
+        """
+        加载 LEF 文件
+        
+        参数:
+            file_path: 文件路径
+            
+        返回:
+            LEF 内容
+        """
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+                
+            # 将 LEF 内容按层和单元分块
+            sections = []
+            current_section = []
+            in_section = False
+            
+            for line in content.split('\n'):
+                line = line.strip()
+                if not line or line.startswith('#'):  # 跳过空行和注释
+                    continue
+                    
+                if line.startswith('LAYER') or line.startswith('MACRO'):
+                    if current_section:
+                        sections.append('\n'.join(current_section))
+                    current_section = [line]
+                    in_section = True
+                elif line.startswith('END'):
+                    if in_section:
+                        current_section.append(line)
+                        sections.append('\n'.join(current_section))
+                        current_section = []
+                        in_section = False
+                elif in_section:
+                    current_section.append(line)
+                    
+            if current_section:
+                sections.append('\n'.join(current_section))
+                
+            # 创建页面映射
+            self.current_page_map = [
+                {
+                    'page': i + 1,
+                    'text': section,
+                    'metadata': {
+                        'type': 'section',
+                        'name': section.split()[1] if len(section.split()) > 1 else f'Section_{i+1}'
+                    }
+                }
+                for i, section in enumerate(sections)
+            ]
+            
+            self.total_pages = len(self.current_page_map)
+            return content
+            
+        except Exception as e:
+            logger.error(f"Error loading LEF: {str(e)}")
+            raise
+            
+    def load_lib(self, file_path: str) -> str:
+        """
+        加载 LIB 文件
+        
+        参数:
+            file_path: 文件路径
+            
+        返回:
+            LIB 内容
+        """
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+                
+            # 将 LIB 内容按单元分块
+            cells = []
+            current_cell = []
+            in_cell = False
+            
+            for line in content.split('\n'):
+                line = line.strip()
+                if not line or line.startswith('#'):  # 跳过空行和注释
+                    continue
+                    
+                if line.startswith('cell'):
+                    if current_cell:
+                        cells.append('\n'.join(current_cell))
+                    current_cell = [line]
+                    in_cell = True
+                elif line.startswith('end'):
+                    if in_cell:
+                        current_cell.append(line)
+                        cells.append('\n'.join(current_cell))
+                        current_cell = []
+                        in_cell = False
+                elif in_cell:
+                    current_cell.append(line)
+                    
+            if current_cell:
+                cells.append('\n'.join(current_cell))
+                
+            # 创建页面映射
+            self.current_page_map = [
+                {
+                    'page': i + 1,
+                    'text': cell,
+                    'metadata': {
+                        'type': 'cell',
+                        'name': cell.split()[1] if len(cell.split()) > 1 else f'Cell_{i+1}'
+                    }
+                }
+                for i, cell in enumerate(cells)
+            ]
+            
+            self.total_pages = len(self.current_page_map)
+            return content
+            
+        except Exception as e:
+            logger.error(f"Error loading LIB: {str(e)}")
             raise

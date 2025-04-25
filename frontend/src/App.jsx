@@ -18,8 +18,8 @@ const App = () => {
         <main className="ml-64 flex-1 min-h-screen bg-gray-100">
           <Routes>
             <Route path="/load-file" element={<LoadFile />} />  
-            <Route path="/chunk-file" element={<ChunkFile />} />  
             <Route path="/parse-file" element={<ParseFile />} />
+            <Route path="/chunk-file" element={<ChunkFile />} />  
             <Route path="/embedding" element={<EmbeddingFile />} />
             <Route path="/indexing" element={<Indexing />} />
             <Route path="/search" element={<Search />} />

@@ -44,59 +44,67 @@ const EmbeddingFile = () => {
   const fetchAvailableDocs = async () => {
     try {
       console.log('开始获取文档列表...');
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 5000); // 5秒超时
+      setStatus('正在获取文档列表...');
       
-      const response = await fetch(`${apiBaseUrl}/documents?type=all`, {
-        signal: controller.signal,
+      const response = await fetch(`${apiBaseUrl}/documents?type=parsed`, {
         headers: {
           'Accept': 'application/json',
           'Content-Type': 'application/json'
         }
       });
       
-      clearTimeout(timeoutId);
-      
       if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+        const errorData = await response.json();
+        throw new Error(errorData.detail || `HTTP error! status: ${response.status}`);
       }
       
       console.log('API响应状态:', response.status);
       const data = await response.json();
       console.log('API响应数据:', data);
-      console.log('文档列表:', data.documents);
+      
       if (!Array.isArray(data.documents)) {
         console.error('文档数据不是数组格式:', data.documents);
+        setStatus('文档数据格式错误');
         return;
       }
+      
       setAvailableDocs(data.documents);
+      setStatus('');
     } catch (error) {
       console.error('获取文档列表出错:', error);
-      if (error.name === 'AbortError') {
-        setStatus('获取文档列表超时，请检查后端服务是否正常运行');
-      } else {
-        setStatus('获取文档列表失败: ' + error.message);
-      }
+      setStatus('获取文档列表失败: ' + error.message);
     }
   };
 
   const fetchEmbeddedDocs = async () => {
     try {
+      setStatus('正在获取已嵌入文档列表...');
       const response = await fetch(`${apiBaseUrl}/list-embedded`);
+      
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.detail || `HTTP error! status: ${response.status}`);
+      }
+      
       const data = await response.json();
       setEmbeddedDocs(data.documents);
+      setStatus('');
     } catch (error) {
-      console.error('Error fetching embedded documents:', error);
+      console.error('获取已嵌入文档列表出错:', error);
+      setStatus('获取已嵌入文档列表失败: ' + error.message);
     }
   };
 
   const handleEmbed = async () => {
     if (!selectedDoc) {
-      setStatus('Please select a document');
+      setStatus('请选择文档');
       return;
     }
     
-    setStatus('Processing...');
+    // 移除 .json 扩展名
+    const docName = selectedDoc.replace('.json', '');
+    
+    setStatus('正在处理中...');
     try {
       const response = await fetch(`${apiBaseUrl}/embed`, {
         method: 'POST',
@@ -104,24 +112,27 @@ const EmbeddingFile = () => {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          documentId: selectedDoc,
-          embeddingProvider: embeddingProvider,
-          embeddingModel: embeddingModel
+          docName: docName,
+          docType: 'chunked',
+          embeddingConfig: {
+            provider: embeddingProvider,
+            model: embeddingModel
+          }
         }),
       });
       
       if (!response.ok) {
         const errorData = await response.json();
-        throw new Error(errorData.detail || 'Failed to create embeddings');
+        throw new Error(errorData.detail || '创建嵌入失败');
       }
       
       const data = await response.json();
       setEmbeddings(data.embeddings);
-      setStatus(`Embedding completed successfully! Saved to: ${data.filepath}`);
+      setStatus(`嵌入完成! 已保存到: ${data.filepath}`);
       fetchEmbeddedDocs(); // 刷新嵌入文档列表
     } catch (error) {
-      console.error('Error:', error);
-      setStatus('Error generating embeddings: ' + error.message);
+      console.error('错误:', error);
+      setStatus('创建嵌入时出错: ' + error.message);
     }
   };
 
@@ -276,7 +287,7 @@ const EmbeddingFile = () => {
         <div className="col-span-3 space-y-4">
           <div className="p-4 border rounded-lg bg-white shadow-sm">
             <div>
-              <label className="block text-sm font-medium mb-1">Select Document</label>
+              <label className="block text-sm font-medium mb-1">选择文档</label>
               <div className="text-sm text-gray-500 mb-2">
                 可用文档数量: {availableDocs.length}
               </div>
@@ -284,8 +295,9 @@ const EmbeddingFile = () => {
                 value={selectedDoc}
                 onChange={(e) => setSelectedDoc(e.target.value)}
                 className="block w-full p-2 border rounded"
+                disabled={status.includes('正在处理中')}
               >
-                <option value="">Choose a document...</option>
+                <option value="">选择文档...</option>
                 {availableDocs.map(doc => (
                   <option key={doc.id} value={doc.name}>
                     {doc.name} ({doc.type})
@@ -295,11 +307,12 @@ const EmbeddingFile = () => {
             </div>
 
             <div className="mt-4">
-              <label className="block text-sm font-medium mb-1">Embedding Provider</label>
+              <label className="block text-sm font-medium mb-1">嵌入提供者</label>
               <select
                 value={embeddingProvider}
                 onChange={(e) => setEmbeddingProvider(e.target.value)}
                 className="block w-full p-2 border rounded"
+                disabled={status.includes('正在处理中')}
               >
                 <option value="openai">OpenAI</option>
                 <option value="bedrock">Bedrock</option>
@@ -309,11 +322,12 @@ const EmbeddingFile = () => {
             </div>
 
             <div className="mt-4">
-              <label className="block text-sm font-medium mb-1">Model</label>
+              <label className="block text-sm font-medium mb-1">模型</label>
               <select
                 value={embeddingModel}
                 onChange={(e) => setEmbeddingModel(e.target.value)}
                 className="block w-full p-2 border rounded"
+                disabled={status.includes('正在处理中')}
               >
                 {modelOptions[embeddingProvider].map(model => (
                   <option key={model.value} value={model.value}>
@@ -325,16 +339,20 @@ const EmbeddingFile = () => {
 
             <button 
               onClick={handleEmbed}
-              className="mt-4 w-full px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
-              disabled={!selectedDoc}
+              className={`mt-4 w-full px-4 py-2 text-white rounded ${
+                status.includes('正在处理中')
+                  ? 'bg-gray-400 cursor-not-allowed'
+                  : 'bg-blue-500 hover:bg-blue-600'
+              }`}
+              disabled={!selectedDoc || status.includes('正在处理中')}
             >
-              Generate Embeddings
+              {status.includes('正在处理中') ? '处理中...' : '生成嵌入'}
             </button>
           </div>
 
           {status && (
             <div className={`p-4 rounded-lg ${
-              status.includes('Error') ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'
+              status.includes('错误') ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'
             }`}>
               {status}
             </div>

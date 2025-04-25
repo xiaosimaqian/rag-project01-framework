@@ -68,7 +68,7 @@ class EmbeddingService:
             model_name="bge-m3:latest"
         )
 
-    def create_embeddings(
+    async def create_embeddings(
             self,
             chunks: List[Dict[str, Any]],
             metadata: Dict[str, Any],
@@ -94,7 +94,7 @@ class EmbeddingService:
             results = []
             for chunk in chunks:
                 # 创建嵌入向量
-                embedding = self.embedding_factory.create_embedding_function(config).embed_query(chunk["content"])
+                embedding = await self.embedding_factory.create_embedding_function(config).aembed_query(chunk["content"])
                 
                 # 准备元数据
                 chunk_metadata = {
