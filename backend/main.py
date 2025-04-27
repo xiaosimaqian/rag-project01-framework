@@ -16,12 +16,12 @@ import pandas as pd
 from pathlib import Path
 from services.generation_service import GenerationService
 from typing import List, Dict, Optional
-from fastapi import FastAPI, Body, HTTPException
-from utils.config import VectorDBProvider
-from services.search_service import SearchService
-import logging
-from pymilvus import connections, utility
-from services.document_processor_service import DocumentProcessor
+from pydantic import BaseModel, Field
+import uuid
+import shutil
+import asyncio
+import aiohttp
+from openai import AsyncOpenAI
 
 # 设置日志
 logging.basicConfig(level=logging.INFO)
@@ -31,34 +31,192 @@ app = FastAPI()
 vector_store_service = None
 search_service = None
 
-# 确保必要的目录存在
-BASE_DIR = os.path.dirname(__file__)  # 指向 backend 目录
-os.makedirs(os.path.join(BASE_DIR, "temp"), exist_ok=True)
-os.makedirs(os.path.join(BASE_DIR, "01-chunked-docs"), exist_ok=True)
-os.makedirs(os.path.join(BASE_DIR, "02-embedded-docs"), exist_ok=True)
-os.makedirs(os.path.join(BASE_DIR, "01-original-docs"), exist_ok=True)
-os.makedirs(os.path.join(BASE_DIR, "03-vector-store"), exist_ok=True)
-os.makedirs(os.path.join(BASE_DIR, "04-search-results"), exist_ok=True)
-
-# Configure CORS
+# 配置CORS
 app.add_middleware(
     CORSMiddleware,
-    # allow_origins=["*"],
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"]
 )
+
+# 配置请求体大小限制
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
+
+# 创建上传文件存储目录
+UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+# 文件存储映射
+file_storage = {}
+
+# 文件存储信息文件路径
+STORAGE_FILE = Path("file_storage.json")
+
+# 配置上传参数
+CHUNK_SIZE = 1024 * 1024  # 1MB chunks
+MAX_UPLOAD_SIZE = 1024 * 1024 * 1024  # 1GB
+UPLOAD_TIMEOUT = 300  # 5 minutes
+
+# API限制
+MAX_CONTEXT_SIZE = 1024 * 1024 * 1024  # 1GB
+MAX_FILE_SIZE = 1024 * 1024 * 1024  # 1GB per file
+MAX_FILES = 10  # 最多10个文件
+
+# Ollama API配置
+OLLAMA_API_BASE = "http://localhost:11434"  # Ollama默认地址
+
+# 添加分块处理相关的常量
+MAX_CHUNK_SIZE = 50 * 1024 * 1024  # 50MB per chunk
+MAX_CHUNKS = 100  # 最多100个块
+
+class GenerationRequest(BaseModel):
+    provider: str
+    model_name: str
+    query: str
+    api_key: Optional[str] = None
+    show_reasoning: bool = True
+    context_file_ids: List[str] = Field(default_factory=list, max_items=MAX_FILES)
+    context_contents: Optional[List[str]] = Field(default=None, max_items=MAX_FILES)
+    search_results: Optional[List[dict]] = None
+    collection_name: Optional[str] = None
+
+    class Config:
+        extra = "allow"  # 允许额外的字段
+
+class FileInfo(BaseModel):
+    file_id: str
+    name: str
+    size: int
+    upload_time: datetime
+    status: str
+    used_count: int = 0
+
+def save_file_storage():
+    """保存file_storage到文件"""
+    try:
+        # 将datetime对象转换为字符串
+        storage_data = {}
+        for file_id, info in file_storage.items():
+            storage_data[file_id] = {
+                "path": info["path"],
+                "name": info["name"],
+                "size": info["size"],
+                "upload_time": info["upload_time"].isoformat(),
+                "status": info["status"],
+                "used_count": info["used_count"]
+            }
+        
+        with open(STORAGE_FILE, "w", encoding="utf-8") as f:
+            json.dump(storage_data, f, ensure_ascii=False, indent=2)
+        logger.info(f"file_storage已保存到文件: {STORAGE_FILE}")
+    except Exception as e:
+        logger.error(f"保存file_storage时出错: {str(e)}")
+
+def load_file_storage():
+    """从文件加载file_storage"""
+    try:
+        if STORAGE_FILE.exists():
+            with open(STORAGE_FILE, "r", encoding="utf-8") as f:
+                storage_data = json.load(f)
+            
+            # 将字符串转换回datetime对象
+            for file_id, info in storage_data.items():
+                file_storage[file_id] = {
+                    "path": info["path"],
+                    "name": info["name"],
+                    "size": info["size"],
+                    "upload_time": datetime.fromisoformat(info["upload_time"]),
+                    "status": info["status"],
+                    "used_count": info["used_count"]
+                }
+            logger.info(f"从文件加载了 {len(file_storage)} 个文件信息")
+        else:
+            logger.info("file_storage文件不存在，将创建新文件")
+    except Exception as e:
+        logger.error(f"加载file_storage时出错: {str(e)}")
 
 @app.on_event("startup")
 async def startup_event():
     """在应用启动时初始化服务"""
     global vector_store_service, search_service
     try:
+        # 初始化向量存储服务
         vector_store_service = VectorStoreService()
         search_service = SearchService()
         collections = vector_store_service.list_collections(provider=VectorDBProvider.MILVUS.value)
         logger.info(f"应用启动时找到以下集合：{collections}")
+        
+        # 加载文件存储信息
+        logger.info("开始加载file_storage")
+        logger.info(f"uploads目录: {UPLOAD_DIR}")
+        logger.info(f"uploads目录是否存在: {UPLOAD_DIR.exists()}")
+        logger.info(f"uploads目录中的文件: {list(UPLOAD_DIR.glob('*'))}")
+        
+        # 首先尝试从file_storage.json加载
+        if STORAGE_FILE.exists():
+            try:
+                logger.info(f"尝试从 {STORAGE_FILE} 加载文件信息")
+                with open(STORAGE_FILE, "r", encoding="utf-8") as f:
+                    storage_data = json.load(f)
+                
+                # 将字符串转换回datetime对象
+                for file_id, info in storage_data.items():
+                    file_storage[file_id] = {
+                        "path": info["path"],
+                        "name": info["name"],
+                        "size": info["size"],
+                        "upload_time": datetime.fromisoformat(info["upload_time"]),
+                        "status": info["status"],
+                        "used_count": info["used_count"]
+                    }
+                logger.info(f"从file_storage.json加载了 {len(file_storage)} 个文件信息")
+            except Exception as e:
+                logger.error(f"从file_storage.json加载失败: {str(e)}")
+                # 如果加载失败，清空file_storage
+                file_storage.clear()
+        
+        # 如果file_storage为空，从uploads目录恢复
+        if not file_storage:
+            logger.info("开始从uploads目录恢复file_storage")
+            for file_path in UPLOAD_DIR.glob("*"):
+                if file_path.is_file():
+                    try:
+                        # 生成文件ID（使用文件名作为ID）
+                        file_id = str(uuid.uuid4())
+                        
+                        # 获取文件信息
+                        file_size = file_path.stat().st_size
+                        file_name = file_path.name
+                        
+                        # 存储文件信息
+                        file_storage[file_id] = {
+                            "path": str(file_path),
+                            "name": file_name,
+                            "size": file_size,
+                            "upload_time": datetime.now(),
+                            "status": "active",
+                            "used_count": 0
+                        }
+                        
+                        logger.info(f"恢复文件信息: {file_name} -> {file_id}")
+                    except Exception as e:
+                        logger.error(f"恢复文件 {file_path} 时出错: {str(e)}")
+                        continue
+            
+            # 保存file_storage到文件
+            save_file_storage()
+            
+            logger.info(f"从uploads目录恢复了 {len(file_storage)} 个文件信息")
+        
+        logger.info(f"file_storage加载完成，共 {len(file_storage)} 个文件")
+        logger.info(f"file_storage内容: {file_storage}")
     except Exception as e:
         logger.error(f"应用启动时初始化服务出错: {e}")
         # 不要在这里抛出异常，让应用继续启动
@@ -67,12 +225,26 @@ async def startup_event():
 async def shutdown_event():
     """在应用关闭时清理资源"""
     global vector_store_service
-    if vector_store_service:
-        try:
-            vector_store_service._disconnect_milvus()
-            logger.info("应用关闭时成功断开 Milvus 连接")
-        except Exception as e:
-            logger.warning(f"应用关闭时断开连接出错: {e}")
+    try:
+        # 断开 Milvus 连接
+        if vector_store_service:
+            try:
+                vector_store_service._disconnect_milvus()
+                logger.info("应用关闭时成功断开 Milvus 连接")
+            except Exception as e:
+                logger.warning(f"应用关闭时断开连接出错: {e}")
+        
+        # 保存file_storage到文件
+        logger.info("开始保存file_storage")
+        save_file_storage()
+        logger.info("file_storage保存完成")
+    except Exception as e:
+        logger.error(f"应用关闭时出错: {e}")
+
+@app.get("/")
+async def root():
+    """根路径处理函数"""
+    return {"message": "Welcome to RAG Framework API"}
 
 @app.post("/process")
 async def process_document(
@@ -1192,27 +1364,246 @@ async def get_generation_models():
         logger.error(f"Error getting generation models: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/generate")
-async def generate_response(
-    query: str = Body(...),
-    provider: str = Body(...),
-    model_name: str = Body(...),
-    search_results: List[Dict] = Body(...),
-    api_key: Optional[str] = Body(None)
-):
-    """生成回答"""
+async def call_ollama_api(model_name: str, prompt: str) -> str:
+    """调用Ollama API"""
     try:
-        generation_service = GenerationService()
-        result = generation_service.generate(
-            provider=provider,
-            model_name=model_name,
-            query=query,
-            search_results=search_results,
-            api_key=api_key
-        )
-        return result
+        logger.info(f"调用Ollama API，模型: {model_name}")
+        logger.info(f"提示词长度: {len(prompt)} 字符")
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{OLLAMA_API_BASE}/api/generate",
+                json={
+                    "model": model_name,
+                    "prompt": prompt,
+                    "stream": False
+                }
+            ) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    logger.error(f"Ollama API错误: {error_text}")
+                    raise Exception(f"Ollama API错误: {error_text}")
+                
+                result = await response.json()
+                logger.info("Ollama API调用成功")
+                return result.get("response", "")
+                
     except Exception as e:
-        logger.error(f"Error generating response: {str(e)}")
+        logger.error(f"调用Ollama API失败: {str(e)}")
+        raise
+
+async def call_openai_api(model_name: str, prompt: str, api_key: str) -> str:
+    """调用OpenAI API"""
+    try:
+        logger.info(f"调用OpenAI API，模型: {model_name}")
+        logger.info(f"提示词长度: {len(prompt)} 字符")
+        
+        if not api_key:
+            raise Exception("未提供OpenAI API密钥")
+            
+        client = AsyncOpenAI(api_key=api_key)
+        
+        response = await client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": "你是一个专业的助手，请基于提供的上下文回答问题。"},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=2000
+        )
+        
+        logger.info("OpenAI API调用成功")
+        return response.choices[0].message.content
+        
+    except Exception as e:
+        logger.error(f"调用OpenAI API失败: {str(e)}")
+        raise
+
+def split_content(content: str, max_chunk_size: int = MAX_CHUNK_SIZE) -> List[str]:
+    """将内容分割成多个块"""
+    chunks = []
+    current_chunk = ""
+    current_size = 0
+    
+    # 按行分割内容
+    lines = content.split('\n')
+    
+    for line in lines:
+        line_size = len(line.encode('utf-8'))
+        
+        # 如果单行超过最大块大小，需要进一步分割
+        if line_size > max_chunk_size:
+            # 如果当前块不为空，先保存
+            if current_chunk:
+                chunks.append(current_chunk)
+                current_chunk = ""
+                current_size = 0
+            
+            # 分割大行
+            words = line.split()
+            current_line = ""
+            for word in words:
+                word_size = len(word.encode('utf-8'))
+                if current_size + word_size > max_chunk_size:
+                    chunks.append(current_line)
+                    current_line = word
+                    current_size = word_size
+                else:
+                    current_line += " " + word if current_line else word
+                    current_size += word_size
+            if current_line:
+                current_chunk = current_line
+        # 如果添加当前行会超出块大小限制
+        elif current_size + line_size > max_chunk_size:
+            chunks.append(current_chunk)
+            current_chunk = line
+            current_size = line_size
+        else:
+            current_chunk += "\n" + line if current_chunk else line
+            current_size += line_size
+    
+    # 添加最后一个块
+    if current_chunk:
+        chunks.append(current_chunk)
+    
+    return chunks
+
+@app.post("/generate")
+async def generate(request: GenerationRequest = Body(..., max_size=MAX_CONTEXT_SIZE)):
+    try:
+        logger.info(f"收到生成请求: {request.dict()}")
+        
+        # 检查文件数量
+        if len(request.context_file_ids) > MAX_FILES:
+            raise HTTPException(status_code=400, detail=f"文件数量超过限制: 最多{MAX_FILES}个文件")
+        
+        # 读取上下文文件内容
+        context_contents = []
+        total_size = 0
+        total_chunks = 0
+        
+        if request.context_contents:  # 如果提供了context_contents，直接使用
+            for content in request.context_contents:
+                if content is None:
+                    continue
+                    
+                # 检查内容大小
+                content_size = len(content.encode('utf-8'))
+                if content_size > MAX_FILE_SIZE:
+                    # 如果内容超过单个文件限制，进行分块
+                    chunks = split_content(content)
+                    if len(chunks) > MAX_CHUNKS:
+                        raise HTTPException(status_code=400, detail=f"文件内容块数超过限制: 最多{MAX_CHUNKS}个块")
+                    
+                    total_chunks += len(chunks)
+                    if total_chunks > MAX_CHUNKS:
+                        raise HTTPException(status_code=400, detail=f"总块数超过限制: 最多{MAX_CHUNKS}个块")
+                    
+                    # 添加分块内容
+                    for i, chunk in enumerate(chunks):
+                        context_contents.append(f"=== 文件块 {i+1}/{len(chunks)} ===\n{chunk}\n=== 块结束 ===\n")
+                else:
+                    total_size += content_size
+                    if total_size > MAX_CONTEXT_SIZE:
+                        raise HTTPException(status_code=400, detail=f"总内容大小超过限制: 最多{MAX_CONTEXT_SIZE/1024/1024}MB")
+                    context_contents.append(content)
+        else:  # 否则从文件读取
+            for file_id in request.context_file_ids:
+                if file_id in file_storage:
+                    file_info = file_storage[file_id]
+                    try:
+                        # 检查文件大小
+                        file_size = Path(file_info["path"]).stat().st_size
+                        if file_size > MAX_FILE_SIZE:
+                            # 如果文件超过大小限制，进行分块读取
+                            chunks = []
+                            with open(file_info["path"], "r", encoding="utf-8") as f:
+                                content = f.read()
+                                chunks = split_content(content)
+                            
+                            if len(chunks) > MAX_CHUNKS:
+                                raise HTTPException(status_code=400, detail=f"文件内容块数超过限制: 最多{MAX_CHUNKS}个块")
+                            
+                            total_chunks += len(chunks)
+                            if total_chunks > MAX_CHUNKS:
+                                raise HTTPException(status_code=400, detail=f"总块数超过限制: 最多{MAX_CHUNKS}个块")
+                            
+                            # 添加分块内容
+                            for i, chunk in enumerate(chunks):
+                                context_contents.append(f"=== 文件: {file_info['name']} 块 {i+1}/{len(chunks)} ===\n{chunk}\n=== 块结束 ===\n")
+                        else:
+                            # 正常读取文件内容
+                            with open(file_info["path"], "r", encoding="utf-8") as f:
+                                content = f.read()
+                                content_size = len(content.encode('utf-8'))
+                                total_size += content_size
+                                if total_size > MAX_CONTEXT_SIZE:
+                                    raise HTTPException(status_code=400, detail=f"总内容大小超过限制: 最多{MAX_CONTEXT_SIZE/1024/1024}MB")
+                                
+                                context_contents.append(f"=== 文件: {file_info['name']} ===\n{content}\n=== 文件结束 ===\n")
+                        
+                        # 更新使用次数
+                        file_storage[file_id]["used_count"] += 1
+                    except Exception as e:
+                        logger.error(f"读取文件 {file_id} 失败: {str(e)}")
+                        raise HTTPException(status_code=500, detail=f"读取文件 {file_info['name']} 失败: {str(e)}")
+                else:
+                    logger.warning(f"文件 {file_id} 不存在")
+                    raise HTTPException(status_code=404, detail=f"文件 {file_id} 不存在")
+        
+        # 构建完整的上下文
+        full_context = "\n".join(context_contents)
+        
+        # 构建完整的提示词，包含上下文和问题
+        full_prompt = f"""你是一个专业的助手。请基于以下文件内容回答问题。如果文件内容中没有相关信息，请说明无法回答。
+注意：如果文件内容被分成了多个块，请确保查看所有相关块的内容。
+
+文件内容：
+{full_context}
+
+问题：
+{request.query}
+
+请提供详细的回答，并说明你的推理过程。如果回答涉及多个文件或文件块的内容，请明确指出信息来源。"""
+
+        # 调用LLM生成回答
+        try:
+            # 根据不同的provider调用相应的API
+            if request.provider == "ollama":
+                # 调用Ollama API
+                response = await call_ollama_api(request.model_name, full_prompt)
+            elif request.provider == "openai":
+                # 调用OpenAI API
+                response = await call_openai_api(request.model_name, full_prompt, request.api_key)
+            else:
+                raise HTTPException(status_code=400, detail=f"不支持的provider: {request.provider}")
+            
+            return {
+                "data": {
+                    "response": response,
+                    "context": full_context,  # 返回使用的上下文内容
+                    "prompt": full_prompt,    # 返回完整的提示词
+                    "used_files": [           # 返回使用的文件信息
+                        {
+                            "file_id": file_id,
+                            "name": file_storage[file_id]["name"],
+                            "size": file_storage[file_id]["size"],
+                            "used_count": file_storage[file_id]["used_count"]
+                        }
+                        for file_id in request.context_file_ids
+                    ]
+                }
+            }
+        except Exception as e:
+            logger.error(f"调用LLM API失败: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"调用LLM API失败: {str(e)}")
+            
+    except HTTPException as he:
+        logger.error(f"生成错误 (HTTP): {he.detail}")
+        raise he
+    except Exception as e:
+        logger.error(f"生成错误: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/search-results")
@@ -1331,4 +1722,299 @@ def get_available_collections():
 
 # 在应用启动时使用这个函数
 collections = get_available_collections()
-print(f"可用的集合：{collections}") 
+print(f"可用的集合：{collections}")
+
+@app.post("/upload-context")
+async def upload_context(file: UploadFile = File(...)):
+    """上传文件接口"""
+    try:
+        logger.info(f"开始接收文件: {file.filename}, 大小: {file.size} bytes")
+        logger.info(f"文件类型: {file.content_type}")
+        logger.info(f"文件头信息: {file.headers}")
+        
+        # 检查文件大小
+        if file.size > MAX_UPLOAD_SIZE:
+            raise HTTPException(status_code=400, detail="文件大小超过限制")
+        
+        # 使用原始文件名
+        file_name = file.filename
+        file_path = UPLOAD_DIR / file_name
+        
+        logger.info(f"上传目录: {UPLOAD_DIR}")
+        logger.info(f"上传目录是否存在: {UPLOAD_DIR.exists()}")
+        logger.info(f"上传目录是否为目录: {UPLOAD_DIR.is_dir()}")
+        logger.info(f"上传目录权限: {oct(UPLOAD_DIR.stat().st_mode)}")
+        logger.info(f"目标文件路径: {file_path}")
+        
+        # 检查文件是否已存在
+        if file_path.exists():
+            logger.info(f"文件已存在: {file_path}")
+            # 查找已存在的文件ID
+            existing_file_id = None
+            for fid, info in file_storage.items():
+                if info["name"] == file_name:
+                    existing_file_id = fid
+                    break
+            
+            if existing_file_id:
+                logger.info(f"返回已存在的文件ID: {existing_file_id}")
+                return {"fileId": existing_file_id, "status": "exists"}
+        
+        # 生成文件ID（使用原始文件名）
+        file_id = file_name
+        
+        logger.info(f"保存文件到: {file_path}")
+        
+        try:
+            # 确保目录存在
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # 保存文件
+            logger.info("开始写入文件...")
+            with file_path.open("wb") as buffer:
+                # 分块读取和写入
+                total_size = 0
+                while True:
+                    try:
+                        # 设置超时
+                        chunk = await asyncio.wait_for(file.read(CHUNK_SIZE), timeout=UPLOAD_TIMEOUT)
+                        if not chunk:
+                            break
+                        buffer.write(chunk)
+                        total_size += len(chunk)
+                        logger.info(f"已写入: {total_size} bytes")
+                    except asyncio.TimeoutError:
+                        raise HTTPException(status_code=408, detail="上传超时")
+            
+            logger.info("文件写入完成")
+                
+            # 验证文件是否成功保存
+            if not file_path.exists():
+                raise Exception("文件保存失败")
+                
+            # 验证文件大小
+            actual_size = file_path.stat().st_size
+            if actual_size != file.size:
+                raise Exception(f"文件大小不匹配: 预期 {file.size} bytes, 实际 {actual_size} bytes")
+                
+            # 验证文件内容
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                    logger.info(f"文件内容长度: {len(content)} 字符")
+                    logger.info(f"文件内容前100个字符: {content[:100]}")
+            except UnicodeDecodeError:
+                logger.warning("文件不是UTF-8编码，尝试使用latin-1编码")
+                with open(file_path, "r", encoding="latin-1") as f:
+                    content = f.read()
+                    logger.info(f"使用latin-1编码读取成功，内容长度: {len(content)} 字符")
+                
+        except Exception as e:
+            logger.error(f"保存文件失败: {e}")
+            # 清理可能的部分文件
+            if file_path.exists():
+                file_path.unlink()
+            raise HTTPException(status_code=500, detail=f"保存文件失败: {str(e)}")
+        
+        # 存储文件信息
+        file_storage[file_id] = {
+            "path": str(file_path),
+            "name": file_name,
+            "size": file.size,
+            "upload_time": datetime.now(),
+            "status": "active",
+            "used_count": 0
+        }
+        
+        # 保存file_storage到文件
+        save_file_storage()
+        
+        logger.info(f"文件上传成功: {file_id}")
+        logger.info(f"文件存储信息: {file_storage[file_id]}")
+        
+        return {"fileId": file_id, "status": "success"}
+    except HTTPException as he:
+        logger.error(f"上传错误 (HTTP): {he.detail}")
+        raise he
+    except Exception as e:
+        logger.error(f"上传错误: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/files")
+async def list_files():
+    """获取所有文件列表"""
+    try:
+        logger.info("开始获取文件列表")
+        logger.info(f"当前file_storage中的文件数量: {len(file_storage)}")
+        logger.info(f"file_storage内容: {file_storage}")
+        
+        files = []
+        for file_id, info in file_storage.items():
+            try:
+                # 验证文件是否存在
+                file_path = Path(info["path"])
+                logger.info(f"检查文件: {file_path}")
+                logger.info(f"文件是否存在: {file_path.exists()}")
+                
+                if not file_path.exists():
+                    logger.warning(f"文件不存在: {file_path}")
+                    continue
+                    
+                # 验证文件大小
+                actual_size = file_path.stat().st_size
+                if actual_size != info["size"]:
+                    logger.warning(f"文件大小不匹配: {file_path}, 预期: {info['size']}, 实际: {actual_size}")
+                    info["size"] = actual_size
+                
+                files.append({
+                    "file_id": file_id,
+                    "name": info["name"],
+                    "size": info["size"],
+                    "upload_time": info["upload_time"],
+                    "status": info.get("status", "active"),
+                    "used_count": info.get("used_count", 0)
+                })
+                logger.info(f"添加文件到列表: {info['name']}")
+            except Exception as e:
+                logger.error(f"处理文件 {file_id} 时出错: {str(e)}")
+                continue
+                
+        logger.info(f"文件列表获取成功，共 {len(files)} 个文件")
+        return {"files": files}
+    except Exception as e:
+        logger.error(f"获取文件列表失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/files/{file_id}")
+async def get_file_content(file_id: str):
+    """获取文件内容"""
+    try:
+        logger.info(f"开始获取文件内容: {file_id}")
+        
+        if file_id not in file_storage:
+            logger.error(f"文件不存在: {file_id}")
+            raise HTTPException(status_code=404, detail="文件不存在")
+            
+        file_info = file_storage[file_id]
+        logger.info(f"找到文件信息: {file_info}")
+        
+        file_path = Path(file_info["path"])
+        logger.info(f"文件路径: {file_path}")
+        logger.info(f"文件路径是否存在: {file_path.exists()}")
+        logger.info(f"文件路径是否为文件: {file_path.is_file()}")
+        logger.info(f"文件路径的父目录: {file_path.parent}")
+        logger.info(f"文件路径的父目录是否存在: {file_path.parent.exists()}")
+        logger.info(f"文件路径的父目录是否为目录: {file_path.parent.is_dir()}")
+        logger.info(f"文件权限: {oct(file_path.stat().st_mode)}")
+        
+        if not file_path.exists():
+            logger.error(f"文件路径不存在: {file_path}")
+            raise HTTPException(status_code=404, detail=f"文件路径不存在: {file_path}")
+            
+        try:
+            # 检查文件大小
+            file_size = file_path.stat().st_size
+            logger.info(f"文件大小: {file_size} bytes")
+            
+            if file_size == 0:
+                logger.warning(f"文件为空: {file_path}")
+                return {
+                    "file_id": file_id,
+                    "name": file_info["name"],
+                    "content": "",
+                    "size": 0,
+                    "status": "empty"
+                }
+            
+            # 尝试不同的编码方式读取文件
+            encodings = ['utf-8', 'latin-1', 'gbk', 'gb2312', 'utf-16']
+            content = None
+            used_encoding = None
+            
+            for encoding in encodings:
+                try:
+                    logger.info(f"尝试使用 {encoding} 编码读取文件")
+                    with open(file_path, "r", encoding=encoding) as f:
+                        content = f.read()
+                        content_size = len(content.encode('utf-8'))
+                        logger.info(f"使用 {encoding} 编码读取成功，内容大小: {content_size} bytes")
+                        logger.info(f"内容前100个字符: {content[:100]}")
+                        used_encoding = encoding
+                        break
+                except UnicodeDecodeError:
+                    logger.warning(f"使用 {encoding} 编码读取失败")
+                    continue
+                except Exception as e:
+                    logger.error(f"使用 {encoding} 编码读取时发生错误: {str(e)}")
+                    continue
+            
+            if content is None:
+                logger.error("所有编码方式都读取失败")
+                raise HTTPException(status_code=400, detail="无法读取文件内容，请检查文件编码")
+            
+            if not content:
+                logger.warning(f"文件内容为空: {file_path}")
+                return {
+                    "file_id": file_id,
+                    "name": file_info["name"],
+                    "content": "",
+                    "size": 0,
+                    "status": "empty"
+                }
+            
+            return {
+                "file_id": file_id,
+                "name": file_info["name"],
+                "content": content,
+                "size": len(content.encode('utf-8')),
+                "status": "success",
+                "encoding": used_encoding
+            }
+            
+        except Exception as e:
+            logger.error(f"读取文件失败: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"读取文件失败: {str(e)}")
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"获取文件内容失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/files/{file_id}")
+async def delete_file(file_id: str):
+    """删除文件"""
+    try:
+        logger.info(f"尝试删除文件: {file_id}")
+        
+        if file_id not in file_storage:
+            logger.error(f"文件不存在: {file_id}")
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        # 获取文件信息
+        file_info = file_storage[file_id]
+        file_path = file_info["path"]
+        
+        logger.info(f"文件路径: {file_path}")
+        
+        # 删除文件
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+                logger.info(f"文件已删除: {file_path}")
+            except Exception as e:
+                logger.error(f"删除文件时出错: {str(e)}")
+                raise HTTPException(status_code=500, detail=f"Error deleting file: {str(e)}")
+        else:
+            logger.warning(f"文件不存在: {file_path}")
+        
+        # 从存储中移除
+        del file_storage[file_id]
+        logger.info(f"文件信息已从存储中移除: {file_id}")
+        
+        return {"status": "success", "message": "File deleted"}
+    except HTTPException as he:
+        logger.error(f"删除文件错误 (HTTP): {he.detail}")
+        raise he
+    except Exception as e:
+        logger.error(f"删除文件错误: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e)) 

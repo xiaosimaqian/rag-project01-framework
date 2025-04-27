@@ -11,6 +11,8 @@ from langchain_ollama import OllamaLLM
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 import requests
+from pymilvus import connections, Collection
+from utils.config import MILVUS_CONFIG
 
 logger = logging.getLogger(__name__)
 
@@ -281,96 +283,130 @@ class GenerationService:
             raise
 
 
-    def generate(
-        self,
-        provider: str,
-        model_name: str,
-        query: str,
-        search_results: List[Dict],
-        api_key: Optional[str] = None,
-        show_reasoning: bool = True
-    ) -> Dict:
-        """
-        生成回答并保存结果
-        
-        参数:
-            provider: 模型提供商，可选值为"huggingface"、"openai"、"deepseek"
-            model_name: 模型名称
-            query: 用户查询
-            search_results: 搜索结果列表，用于构建上下文
-            api_key: API密钥（对于API调用）
-            show_reasoning: 是否显示推理过程（仅对DeepSeek推理模型有效）
-            
-        返回:
-            包含生成回答和保存路径的字典
-        """
+    def generate(self, provider: str, model_name: str, query: str, search_results: List[Dict] = None, collection_name: str = None, api_key: str = None, additional_context: str = None) -> Dict:
+        """生成回答"""
         try:
-            # 验证输入参数
-            if not provider or not model_name:
-                raise ValueError("Provider and model_name are required")
-            if not query:
-                raise ValueError("Query is required")
-            if not search_results:
-                raise ValueError("Search results are required")
-                
-            # 验证提供商是否支持
-            if provider not in self.models:
-                raise ValueError(f"Unsupported provider: {provider}")
-                
-            # 验证模型是否支持
-            if model_name not in self.models[provider]:
-                raise ValueError(f"Unsupported model: {model_name} for provider: {provider}")
+            # 获取模型配置
+            model_config = self.get_model_config(provider, model_name)
+            if not model_config:
+                raise ValueError(f"不支持的模型: {provider}/{model_name}")
             
             # 准备上下文
-            context = "\n\n".join([
-                f"[Source {i+1}]: {result.get('text', result.get('content', ''))}"
-                for i, result in enumerate(search_results)
-            ])
+            context_parts = []
             
-            logger.info(f"Generating response with provider: {provider}, model: {model_name}")
+            # 添加搜索结果上下文
+            if search_results:
+                # 从搜索结果中提取上下文
+                for result in search_results:
+                    context_parts.append(f"搜索结果：\n{result['content']}\n")
+                    
+            # 添加额外的上下文文件内容
+            if additional_context:
+                context_parts.append(f"补充上下文：\n{additional_context}\n")
+                    
+            # 从collection中获取上下文
+            if collection_name:
+                try:
+                    # 连接到 Milvus
+                    connections.connect(
+                        alias="default",
+                        uri=MILVUS_CONFIG["uri"]
+                    )
+                    
+                    # 获取集合
+                    collection = Collection(collection_name)
+                    collection.load()
+                    
+                    # 执行向量搜索
+                    search_params = {
+                        "metric_type": "L2",
+                        "params": {"nprobe": 10}
+                    }
+                    
+                    # 获取查询向量
+                    query_vector = self.get_query_embedding(query, provider, model_name, api_key)
+                    
+                    # 执行搜索
+                    results = collection.search(
+                        data=[query_vector],
+                        anns_field="vector",
+                        param=search_params,
+                        limit=5,  # 获取前5个最相似的结果
+                        output_fields=["content", "document_name", "chunk_id", "page_number"]
+                    )
+                    
+                    # 提取上下文
+                    for hit in results[0]:
+                        context_parts.append(f"集合搜索结果：\n{hit.entity.content}\n")
+                    
+                except Exception as e:
+                    logger.error(f"从 collection 获取上下文时出错: {str(e)}")
+                    raise
+                finally:
+                    try:
+                        connections.disconnect("default")
+                    except Exception as e:
+                        logger.warning(f"断开 Milvus 连接时出错: {str(e)}")
             
-            # 根据不同提供商生成回答
-            if provider == "huggingface":
-                response = self._generate_with_huggingface(model_name, query, context)
-            elif provider == "openai":
-                response = self._generate_with_openai(model_name, query, context, api_key)
-            elif provider == "deepseek":
-                response = self._generate_with_deepseek(model_name, query, context, api_key, show_reasoning)
-            elif provider == "ollama":
-                response = self._generate_with_ollama(model_name, query, context, show_reasoning)
-            else:
-                raise ValueError(f"Unsupported provider: {provider}")
-                
-            # 验证响应
-            if not isinstance(response, str):
-                raise TypeError(f"Expected string response, got {type(response)}")
-                
-            # 准备保存的结果
-            result = {
-                "query": query,
-                "timestamp": datetime.now().isoformat(),
-                "provider": provider,
-                "model": model_name,
-                "response": response,
-                "context": search_results
-            }
+            # 合并所有上下文
+            context = "\n".join(context_parts)
             
-            # 生成文件名并保存
-            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-            filename = f"generation_{provider}_{model_name}_{timestamp}.json"
-            filepath = os.path.join("05-generation-results", filename)
+            if not context:
+                raise ValueError("无法获取上下文信息")
             
-            with open(filepath, "w", encoding="utf-8") as f:
-                json.dump(result, f, ensure_ascii=False, indent=2)
-                
+            # 构建提示词
+            prompt = self._build_prompt(query, context, model_config)
+            
+            # 调用模型生成回答
+            response = self._call_model(prompt, model_config, api_key)
+            
             return {
-                "response": response,
-                "saved_filepath": filepath
+                "status": "success",
+                "message": "生成成功",
+                "data": {
+                    "query": query,
+                    "response": response,
+                    "model": model_name,
+                    "provider": provider,
+                    "context": context[:1000]  # 只返回前1000个字符的上下文
+                }
             }
             
         except Exception as e:
-            logger.error(f"Error in generation: {str(e)}", exc_info=True)
-            raise
+            logger.error(f"生成回答时出错: {str(e)}")
+            raise ValueError(f"生成回答失败: {str(e)}")
+        
+    def get_query_embedding(self, query: str, provider: str, model_name: str, api_key: str = None) -> List[float]:
+        """获取查询的向量表示"""
+        try:
+            # 获取模型配置
+            model_config = self.get_model_config(provider, model_name)
+            if not model_config:
+                raise ValueError(f"不支持的模型: {provider}/{model_name}")
+            
+            # 调用模型获取向量
+            if provider == "openai":
+                response = openai.Embedding.create(
+                    input=query,
+                    model="text-embedding-3-small",  # 使用与集合相同的嵌入模型
+                    api_key=api_key
+                )
+                return response["data"][0]["embedding"]
+            elif provider == "ollama":
+                response = requests.post(
+                    f"{model_config['base_url']}/api/embeddings",
+                    json={
+                        "model": "bge-m3:latest",  # 使用与集合相同的嵌入模型
+                        "prompt": query
+                    }
+                )
+                return response.json()["embedding"]
+            else:
+                raise ValueError(f"不支持的提供商: {provider}")
+            
+        except Exception as e:
+            logger.error(f"获取查询向量时出错: {str(e)}")
+            raise ValueError(f"获取查询向量失败: {str(e)}")
 
     def get_available_models(self) -> Dict:
         """
@@ -380,3 +416,62 @@ class GenerationService:
             包含所有支持模型的字典
         """
         return self.models 
+
+    def get_model_config(self, provider: str, model_name: str) -> Dict:
+        """获取模型配置"""
+        try:
+            if provider not in self.models:
+                raise ValueError(f"不支持的提供商: {provider}")
+            
+            if model_name not in self.models[provider]:
+                raise ValueError(f"不支持的模型: {model_name}")
+            
+            # 获取模型配置
+            model_config = {
+                "provider": provider,
+                "model_name": model_name,
+                "base_url": "http://localhost:11434" if provider == "ollama" else None
+            }
+            
+            return model_config
+            
+        except Exception as e:
+            logger.error(f"获取模型配置时出错: {str(e)}")
+            raise ValueError(f"获取模型配置失败: {str(e)}")
+
+    def _build_prompt(self, query: str, context: str, model_config: Dict) -> str:
+        """构建提示词"""
+        return f"""请基于以下上下文回答问题。如果上下文中没有相关信息，请说明无法回答。
+
+问题：{query}
+
+上下文：
+{context}
+
+回答："""
+
+    def _call_model(self, prompt: str, model_config: Dict, api_key: str = None) -> str:
+        """调用模型生成回答"""
+        try:
+            provider = model_config["provider"]
+            model_name = model_config["model_name"]
+            
+            # 从提示词中提取问题和上下文
+            parts = prompt.split("\n\n")
+            query = parts[0].replace("问题：", "").strip()
+            context = parts[1].replace("上下文：", "").strip()
+            
+            if provider == "huggingface":
+                return self._generate_with_huggingface(model_name, query, context)
+            elif provider == "openai":
+                return self._generate_with_openai(model_name, query, context, api_key)
+            elif provider == "deepseek":
+                return self._generate_with_deepseek(model_name, query, context, api_key)
+            elif provider == "ollama":
+                return self._generate_with_ollama(model_name, query, context)
+            else:
+                raise ValueError(f"不支持的提供商: {provider}")
+            
+        except Exception as e:
+            logger.error(f"调用模型时出错: {str(e)}")
+            raise ValueError(f"调用模型失败: {str(e)}") 
