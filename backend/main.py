@@ -1,7 +1,8 @@
 import os
 import json
 from datetime import datetime
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body, Query, Request, Depends
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body, Query, Request, Depends, APIRouter
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from services.loading_service import LoadingService
 from services.chunking_service import ChunkingService
@@ -27,20 +28,15 @@ from openai import AsyncOpenAI
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# 获取项目根目录
+BASE_DIR = Path(__file__).resolve().parent
+
 app = FastAPI()
+router = APIRouter(prefix="/api")
 vector_store_service = None
 search_service = None
 
 # 配置CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"]
-)
-
-# 配置请求体大小限制
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -142,7 +138,7 @@ def load_file_storage():
     except Exception as e:
         logger.error(f"加载file_storage时出错: {str(e)}")
 
-@app.on_event("startup")
+@router.on_event("startup")
 async def startup_event():
     """在应用启动时初始化服务"""
     global vector_store_service, search_service
@@ -204,49 +200,36 @@ async def startup_event():
                             "status": "active",
                             "used_count": 0
                         }
-                        
-                        logger.info(f"恢复文件信息: {file_name} -> {file_id}")
                     except Exception as e:
-                        logger.error(f"恢复文件 {file_path} 时出错: {str(e)}")
-                        continue
-            
-            # 保存file_storage到文件
-            save_file_storage()
-            
-            logger.info(f"从uploads目录恢复了 {len(file_storage)} 个文件信息")
+                        logger.error(f"处理文件 {file_path} 时出错: {str(e)}")
         
         logger.info(f"file_storage加载完成，共 {len(file_storage)} 个文件")
         logger.info(f"file_storage内容: {file_storage}")
     except Exception as e:
-        logger.error(f"应用启动时初始化服务出错: {e}")
-        # 不要在这里抛出异常，让应用继续启动
+        logger.error(f"启动时出错: {str(e)}")
 
-@app.on_event("shutdown")
+@router.on_event("shutdown")
 async def shutdown_event():
     """在应用关闭时清理资源"""
-    global vector_store_service
     try:
         # 断开 Milvus 连接
         if vector_store_service:
-            try:
-                vector_store_service._disconnect_milvus()
-                logger.info("应用关闭时成功断开 Milvus 连接")
-            except Exception as e:
-                logger.warning(f"应用关闭时断开连接出错: {e}")
+            vector_store_service.disconnect()
+            logger.info("应用关闭时成功断开 Milvus 连接")
         
-        # 保存file_storage到文件
+        # 保存文件存储信息
         logger.info("开始保存file_storage")
         save_file_storage()
         logger.info("file_storage保存完成")
     except Exception as e:
-        logger.error(f"应用关闭时出错: {e}")
+        logger.error(f"关闭时出错: {str(e)}")
 
-@app.get("/")
+@router.get("/")
 async def root():
-    """根路径处理函数"""
-    return {"message": "Welcome to RAG Framework API"}
+    """根路径"""
+    return {"message": "Welcome to RAG API"}
 
-@app.post("/process")
+@router.post("/process")
 async def process_document(
     file: UploadFile,
     chunk_size: int = 500,
@@ -270,10 +253,23 @@ async def process_document(
             model_name=embedding_model
         )
         
-        # 3. 处理文档
-        processor = DocumentProcessor()
-        chunks = processor.process_document(
-            file_path,
+        # 3. 使用LoadingService和ChunkingService处理文档
+        loading_service = LoadingService()
+        chunking_service = ChunkingService()
+        
+        # 加载文档
+        raw_text = loading_service.load_document(file_path, "text")
+        metadata = {
+            "filename": file.filename,
+            "total_pages": loading_service.get_total_pages(),
+            "loading_method": "text"
+        }
+        
+        # 分块处理
+        chunks = chunking_service.chunk_text(
+            text=raw_text,
+            method="recursive",
+            metadata=metadata,
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap
         )
@@ -311,7 +307,7 @@ async def process_document(
         logger.error(f"处理文档时出错: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/save")
+@router.post("/save")
 async def save_chunks(data: dict):
     try:
         doc_name = data.get("docName")
@@ -347,7 +343,7 @@ async def save_chunks(data: dict):
             detail=str(e)
         )
 
-@app.get("/list-docs")
+@router.get("/list-docs")
 async def list_documents():
     try:
         docs = []
@@ -366,7 +362,7 @@ async def list_documents():
         logger.error(f"Error listing documents: {str(e)}")
         raise
 
-@app.post("/embed")
+@router.post("/embed")
 async def embed_document(
     data: dict = Body(...)
 ):
@@ -375,6 +371,8 @@ async def embed_document(
         doc_type = data.get("docType", "chunked")  # 默认为 chunked 类型
         embedding_config = data.get("embeddingConfig", {})
         
+        logger.info(f"开始处理嵌入请求 - 文档: {doc_name}, 类型: {doc_type}, 配置: {embedding_config}")
+        
         if not doc_name:
             raise ValueError("文档名称不能为空")
             
@@ -382,12 +380,16 @@ async def embed_document(
         chunked_dir = os.path.join(BASE_DIR, "01-chunked-docs")
         file_path = os.path.join(chunked_dir, f"{doc_name}.json")
         
+        logger.info(f"查找文档文件: {file_path}")
+        
         # 如果文件不存在，尝试查找解析后的文件
         if not os.path.exists(file_path):
+            logger.info(f"未找到原始文件，尝试查找解析后的文件")
             # 查找以 "parsed_" 开头且以 ".json" 结尾的文件
             for filename in os.listdir(chunked_dir):
                 if filename.startswith(f"parsed_{doc_name}") and filename.endswith(".json"):
                     file_path = os.path.join(chunked_dir, filename)
+                    logger.info(f"找到解析后的文件: {file_path}")
                     break
                     
         if not os.path.exists(file_path):
@@ -400,6 +402,7 @@ async def embed_document(
             )
             
         # 读取文档内容
+        logger.info(f"开始读取文档内容: {file_path}")
         with open(file_path, 'r', encoding='utf-8') as f:
             doc_data = json.load(f)
             
@@ -410,9 +413,11 @@ async def embed_document(
         # 根据文档格式处理文本块
         if "chunks" in doc_data:
             # 标准格式
+            logger.info("使用标准格式处理文本块")
             chunks = doc_data["chunks"]
         elif "content" in doc_data:
             # parsed 格式
+            logger.info("使用parsed格式处理文本块")
             chunks = [
                 {
                     "content": item["content"],
@@ -427,7 +432,10 @@ async def embed_document(
             ]
         
         if not chunks:
+            logger.error("文档没有可用的文本块")
             raise ValueError("文档没有可用的文本块")
+            
+        logger.info(f"找到 {len(chunks)} 个文本块")
             
         # 创建嵌入配置
         embedding_config = EmbeddingConfig(
@@ -435,13 +443,16 @@ async def embed_document(
             model_name=embedding_config.get("model", "bge-m3:latest")
         )
         
+        logger.info(f"使用配置创建嵌入: {embedding_config}")
+        
         # 创建嵌入
         embedding_service = EmbeddingService()
-        embeddings = await embedding_service.create_embeddings(
+        embeddings = embedding_service.create_embeddings(
             chunks=chunks,
-            metadata=metadata,
-            doc_timestamp=datetime.now().strftime("%Y%m%d%H%M%S")
+            metadata=metadata
         )
+        
+        logger.info(f"成功创建 {len(embeddings)} 个嵌入向量")
         
         # 保存嵌入结果
         output_dir = os.path.join(BASE_DIR, "02-embedded-docs")
@@ -452,9 +463,26 @@ async def embed_document(
             f"{doc_name}_embeddings.json"
         )
         
+        logger.info(f"保存嵌入结果到: {output_path}")
+        
+        # 构建正确的嵌入数据结构
+        embeddings_data = {
+            "embeddings": embeddings,
+            "metadata": {
+                "document_name": doc_name,
+                "embedding_provider": embedding_config.provider,
+                "embedding_model": embedding_config.model_name,
+                "created_at": datetime.now().isoformat(),
+                "vector_dimension": len(embeddings[0]["embedding"]) if embeddings else 0,
+                "total_vectors": len(embeddings)
+            }
+        }
+        
         with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(embeddings, f, ensure_ascii=False, indent=2)
+            json.dump(embeddings_data, f, ensure_ascii=False, indent=2)
             
+        logger.info("嵌入处理完成")
+        
         return {
             "status": "success",
             "message": f"成功为文档 {doc_name} 创建嵌入",
@@ -463,13 +491,13 @@ async def embed_document(
         }
         
     except Exception as e:
-        logger.error(f"创建嵌入时出错: {str(e)}")
+        logger.error(f"创建嵌入时出错: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=str(e)
         )
 
-@app.get("/list-embedded")
+@router.get("/list-embedded")
 async def list_embedded_docs():
     """List all embedded documents"""
     try:
@@ -490,6 +518,7 @@ async def list_embedded_docs():
                         data = json.load(f)
                         # 从metadata字段中获取信息
                         metadata = data.get("metadata", {})
+                        total_vectors = len(data.get("embeddings", []))
                         doc_info = {
                             "name": filename,
                             "metadata": {
@@ -497,82 +526,92 @@ async def list_embedded_docs():
                                 "embedding_model": metadata.get("embedding_model", "unknown"),
                                 "embedding_provider": metadata.get("embedding_provider", "unknown"),
                                 "embedding_timestamp": metadata.get("created_at", ""),
-                                "vector_dimension": metadata.get("vector_dimension", 0)
+                                "vector_dimension": metadata.get("vector_dimension", 0),
+                                "total_vectors": total_vectors
                             }
                         }
                         logger.info(f"Added document info: {doc_info}")
                         documents.append(doc_info)
                 except Exception as e:
-                    logger.error(f"Error reading file {file_path}: {str(e)}")
-                    
+                    logger.warning(f"Error reading file {file_path}: {str(e)}，已跳过该文件")
+                    continue
         logger.info(f"Total documents found: {len(documents)}")
         return {"documents": documents}
     except Exception as e:
         logger.error(f"Error listing embedded documents: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/index")
+@router.post("/index")
 async def index_document(
-    data: dict = Body(...)
+    request: Request,
+    provider: str = Query("milvus", description="向量数据库类型：milvus, milvus_lite, milvus_standalone"),
+    index_mode: str = Query("", description="索引模式：flat, ivf_flat, ivf_sq8, ivf_pq")
 ):
+    """索引文档到向量数据库"""
     try:
-        # 从请求中获取参数
-        embeddings_file = data.get("embeddingsFile")
-        if not embeddings_file:
-            raise HTTPException(status_code=400, detail="未提供embeddingsFile参数")
-            
-        # 构建完整的文件路径
-        embeddings_path = os.path.join(os.path.dirname(__file__), "02-embedded-docs", embeddings_file)
-        if not os.path.exists(embeddings_path):
-            raise HTTPException(status_code=404, detail=f"嵌入文件不存在: {embeddings_file}")
-            
-        # 读取嵌入文件
-        with open(embeddings_path, 'r', encoding='utf-8') as f:
-            embeddings_data = json.load(f)
-            
-        # 获取集合名称
-        collection_name = data.get("targetCollectionName")
-        if not collection_name:
-            # 如果没有指定集合名称，使用嵌入文件的名称（去掉.json后缀）
-            collection_name = os.path.splitext(embeddings_file)[0]
-            
-        # 创建向量数据库配置
-        vector_db_config = VectorDBConfig(
-            provider="milvus",
-            index_mode="HNSW",
-            target_collection_name=collection_name
+        data = await request.json()
+        document_name = data.get("document_name")
+        if not document_name:
+            raise HTTPException(status_code=400, detail="缺少 document_name 参数")
+        vector_store_service = VectorStoreService()
+        config = VectorDBConfig(
+            provider=provider,  # 关键：严格用前端传来的 provider
+            index_mode=index_mode,
+            target_collection_name=data.get("target_collection_name") or document_name
         )
-        
-        # 创建向量存储服务实例
-        vector_store = VectorStoreService()
-        
-        # 执行索引
-        result = vector_store.index_embeddings(embeddings_data, vector_db_config)
-        
-        # 验证返回的数据结构
-        if not isinstance(result, dict):
-            raise ValueError("索引结果格式错误")
-            
-        if "details" not in result:
-            raise ValueError("索引结果缺少details字段")
-            
-        if "total_vectors" not in result["details"]:
-            raise ValueError("索引结果缺少total_vectors字段")
-            
-        if result["details"]["total_vectors"] == 0:
-            raise ValueError("索引结果中向量数量为0")
-            
-        return {
-            "status": "success",
-            "message": "文档索引成功",
-            "data": result
+        embeddings_file = f"02-embedded-docs/{document_name}_embeddings.json"
+        with open(embeddings_file, "r", encoding="utf-8") as f:
+            embeddings_data = json.load(f)
+
+        # 兼容嵌入数据为对象数组的情况，提取 embedding 字段
+        vectors = embeddings_data.get("vectors") or embeddings_data.get("embeddings") or []
+        if isinstance(vectors, list) and len(vectors) > 0 and isinstance(vectors[0], dict) and "embedding" in vectors[0]:
+            vectors = [v["embedding"] for v in vectors]
+
+        print("【main.py】最终传递给后端的vectors类型：", type(vectors))
+        print("【main.py】vectors长度：", len(vectors))
+        if isinstance(vectors, list) and len(vectors) > 0:
+            print("【main.py】第一个向量类型：", type(vectors[0]), "内容：", vectors[0])
+            if isinstance(vectors[0], list):
+                print("【main.py】第一个向量长度：", len(vectors[0]))
+
+        # 用提取后的 vectors 替换原有字段
+        embeddings_data["vectors"] = vectors
+
+        result = vector_store_service.index_embeddings(embeddings_data, config)
+        # 新增：判断返回值
+        if not result or result.get("status") == "error":
+            raise HTTPException(status_code=500, detail=result.get("message", "索引失败"))
+        # 构建前端需要的完整返回结构
+        details = {
+            "database": result.get("provider", provider),
+            "collection_name": result.get("details", {}).get("collection_name", config.target_collection_name),
+            "index_mode": index_mode,
+            "action": "create" if not data.get("target_collection_name") else "append",
+            "total_vectors": result.get("total_vectors", 0),
+            "total_entities": result.get("total_vectors", 0),
+            "processing_time": 0,
+            "index_size": "N/A",
+            "index_type": result.get("details", {}).get("index_type", "FLAT"),
+            "metric_type": result.get("details", {}).get("metric_type", "L2"),
+            "index_params": result.get("details", {}).get("index_params", {}),
+            "dimension": result.get("details", {}).get("dimension", 0)
         }
-        
+        return {
+            "data": {
+                "status": "success",
+                "message": "文档索引成功",
+                "provider": result.get("provider", provider),
+                "count": result.get("count", 0),
+                "total_vectors": result.get("total_vectors", 0),
+                "details": details
+            }
+        }
     except Exception as e:
-        logger.error(f"索引文档失败: {str(e)}", exc_info=True)
+        logger.error(f"索引文档失败: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/providers")
+@router.get("/providers")
 async def get_providers():
     """获取支持的向量数据库列表"""
     try:
@@ -586,69 +625,34 @@ async def get_providers():
             detail=str(e)
         )
 
-@app.get("/collections")
+@router.get("/collections")
 async def get_collections(
-    provider: VectorDBProvider = Query(default=VectorDBProvider.MILVUS)
+    provider: str = Query("milvus")
 ):
-    """获取指定向量数据库中的集合"""
+    """获取指定向量数据库中的集合，支持 provider=all 返回所有数据库集合"""
     try:
         vector_store_service = VectorStoreService()
-        collections = vector_store_service.list_collections(provider.value)
-        return {"collections": collections}
-    except Exception as e:
-        logger.error(f"Error getting collections: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
-        )
-
-@app.post("/search")
-async def search(
-    data: dict = Body(...)
-):
-    """执行向量搜索"""
-    try:
-        # 从请求体中获取参数
-        query = data.get("query")
-        collection_name = data.get("collection_name")
-        provider = data.get("provider", "milvus")
-        top_k = data.get("top_k", 3)
-        threshold = data.get("threshold", 0.7)
-        
-        if not query or not collection_name:
-            raise HTTPException(status_code=400, detail="Missing required parameters: query and collection_name")
-            
-        logger.info(f"Search request - Query: {query}, Collection: {collection_name}, Provider: {provider}, Top K: {top_k}, Threshold: {threshold}")
-        
-        # 创建向量数据库配置
-        vector_db_config = VectorDBConfig(
-            provider=provider,
-            index_mode="flat"  # 使用默认的 flat 索引模式进行搜索
-        )
-        
-        # 执行搜索
-        results = await search_service.search(
-            query=query,
-            collection_name=collection_name,
-            provider=provider,
-            config=vector_db_config,
-            top_k=top_k,
-            threshold=threshold
-        )
-        
-        return results
-        
-    except Exception as e:
-        logger.error(f"Error performing search: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/collections/{provider}")
-async def get_provider_collections(provider: str):
-    """Get collections for a specific vector database provider"""
-    try:
-        vector_store_service = VectorStoreService()
-        collections = vector_store_service.list_collections(provider)
-        return {"collections": collections}
+        if provider.lower() in ["all", "", "*", "any"]:
+            all_providers = [
+                VectorDBProvider.MILVUS.value,
+                "milvus_lite",
+                "milvus_standalone",
+                VectorDBProvider.CHROMA.value
+            ]
+            collections = []
+            for p in all_providers:
+                try:
+                    for c in vector_store_service.list_collections(p):
+                        c["provider"] = p
+                        collections.append(c)
+                except Exception as e:
+                    logger.warning(f"获取 provider={p} 的集合失败: {e}")
+            return {"collections": collections}
+        else:
+            collections = vector_store_service.list_collections(provider)
+            for c in collections:
+                c["provider"] = provider
+            return {"collections": collections}
     except Exception as e:
         logger.error(f"Error getting collections for provider {provider}: {str(e)}")
         raise HTTPException(
@@ -656,7 +660,7 @@ async def get_provider_collections(provider: str):
             detail=str(e)
         )
 
-@app.get("/collections/{provider}/{collection_name}")
+@router.get("/collections/{provider}/{collection_name}")
 async def get_collection_info(provider: str, collection_name: str):
     """Get detailed information about a specific collection"""
     try:
@@ -670,7 +674,7 @@ async def get_collection_info(provider: str, collection_name: str):
             detail=str(e)
         )
 
-@app.delete("/collections/{provider}/{collection_name}")
+@router.delete("/collections/{provider}/{collection_name}")
 async def delete_collection(provider: str, collection_name: str):
     """Delete a specific collection"""
     try:
@@ -690,95 +694,45 @@ async def delete_collection(provider: str, collection_name: str):
             detail=str(e)
         )
 
-@app.get("/documents")
+@router.get("/documents")
 async def get_documents(type: str = Query("all")):
+    """获取已处理文件列表"""
     try:
-        documents = []
-        logger.info(f"开始获取文档列表,类型: {type}")
-        
-        # 读取loaded文档
-        if type in ["all", "loaded"]:
-            loaded_dir = "01-loaded-docs"
-            logger.info(f"读取loaded文档目录: {loaded_dir}")
-            if os.path.exists(loaded_dir):
-                for filename in os.listdir(loaded_dir):
-                    if filename.endswith('.json'):
-                        file_path = os.path.join(loaded_dir, filename)
-                        try:
-                            with open(file_path, 'r', encoding='utf-8') as f:
-                                doc_data = json.load(f)
-                                documents.append({
-                                    "id": filename,
-                                    "name": filename,
-                                    "type": "loaded",
-                                    "metadata": {
-                                        "total_pages": doc_data.get("total_pages"),
-                                        "total_chunks": doc_data.get("total_chunks"),
-                                        "loading_method": doc_data.get("loading_method"),
-                                        "chunking_method": doc_data.get("chunking_method"),
-                                        "timestamp": doc_data.get("timestamp")
-                                    }
-                                })
-                        except json.JSONDecodeError as e:
-                            logger.error(f"JSON解析错误,文件 {filename}: {str(e)}")
-                            continue
-                        except Exception as e:
-                            logger.error(f"读取loaded文件 {filename} 时出错: {str(e)}")
-                            continue
-
-        # 读取chunked文档(包括parsed文件)
-        if type in ["all", "chunked", "parsed"]:
-            chunked_dir = "01-chunked-docs"
-            logger.info(f"读取chunked文档目录: {chunked_dir}")
-            if os.path.exists(chunked_dir):
-                for filename in os.listdir(chunked_dir):
-                    if filename.endswith('.json'):
-                        file_path = os.path.join(chunked_dir, filename)
-                        try:
-                            with open(file_path, 'r', encoding='utf-8') as f:
-                                doc_data = json.load(f)
-                                # 根据文件名判断文档类型
-                                doc_type = "parsed" if filename.startswith("parsed_") else "chunked"
-                                documents.append({
-                                    "id": filename,
-                                    "name": filename,
-                                    "type": doc_type,
-                                    "metadata": {
-                                        "total_pages": doc_data.get("total_pages"),
-                                        "total_chunks": doc_data.get("total_chunks"),
-                                        "chunking_method": doc_data.get("chunking_method"),
-                                        "timestamp": doc_data.get("timestamp")
-                                    }
-                                })
-                        except json.JSONDecodeError as e:
-                            logger.error(f"JSON解析错误,文件 {filename}: {str(e)}")
-                            continue
-                        except Exception as e:
-                            logger.error(f"读取chunked文件 {filename} 时出错: {str(e)}")
-                            continue
-            else:
-                logger.warning(f"目录不存在: {chunked_dir}")
-        
-        # 按时间戳排序,最新的在前面
-        def get_timestamp(doc):
+        parsed_files_dir = Path(__file__).parent / "01-loaded-docs"
+        if not parsed_files_dir.exists():
+            return []
+            
+        files = []
+        for file_path in parsed_files_dir.glob("*.json"):
             try:
-                timestamp = doc.get("metadata", {}).get("timestamp", "")
-                return timestamp if timestamp else "1970-01-01T00:00:00"
-            except:
-                return "1970-01-01T00:00:00"
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    metadata = data.get('metadata', {})
+                    files.append({
+                        'id': file_path.stem,
+                        'filename': metadata.get('filename', file_path.stem),
+                        'file_type': metadata.get('file_type', 'unknown'),
+                        'loading_method': metadata.get('loading_method', 'unknown'),
+                        'parsing_method': metadata.get('parsing_method', 'unknown'),
+                        'timestamp': metadata.get('timestamp', ''),
+                        'total_pages': metadata.get('total_pages', 0),
+                        'total_chunks': metadata.get('total_chunks', 0)
+                    })
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON解析错误 {file_path}: {str(e)}")
+                continue
+            except Exception as e:
+                logger.error(f"读取文件 {file_path} 失败: {str(e)}")
+                continue
                 
-        documents.sort(key=get_timestamp, reverse=True)
-        
-        logger.info(f"成功获取文档列表,共 {len(documents)} 个文档")
-        return {"documents": documents}
+        return sorted(files, key=lambda x: x.get('timestamp', ''), reverse=True)
     except Exception as e:
-        logger.error(f"获取文档列表时出错: {str(e)}", exc_info=True)
+        logger.error(f"获取已处理文件列表失败: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/documents/{doc_name}")
-async def get_document(doc_name: str, type: str = Query("loaded")):
+@router.get("/documents/{doc_name}")
+async def get_document(doc_name: str, type: str = Query("loaded"), start: int = Query(0), limit: int = Query(20)):
     try:
-
         base_name = doc_name.replace('.json', '')
         file_name = f"{base_name}.json"
         
@@ -795,6 +749,23 @@ async def get_document(doc_name: str, type: str = Query("loaded")):
         with open(file_path, 'r', encoding='utf-8') as f:
             doc_data = json.load(f)
             
+        # 如果是分块文档，需要处理分页
+        if type == "chunked" and "chunks" in doc_data:
+            total_chunks = len(doc_data["chunks"])
+            # 确保start和limit在有效范围内
+            start = max(0, min(start, total_chunks))
+            end = min(start + limit, total_chunks)
+            
+            # 返回分页后的数据
+            return {
+                "filename": doc_data.get("filename", doc_name),
+                "total_chunks": total_chunks,
+                "total_pages": doc_data.get("total_pages", 1),
+                "loading_method": doc_data.get("loading_method", "parsed"),
+                "chunking_method": doc_data.get("chunking_method", "unknown"),
+                "chunks": doc_data["chunks"][start:end]
+            }
+            
         return doc_data
     except HTTPException:
         raise
@@ -802,37 +773,39 @@ async def get_document(doc_name: str, type: str = Query("loaded")):
         logger.error(f"Error reading document: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.delete("/documents/{doc_name}")
+@router.delete("/documents/{doc_name}")
 async def delete_document(doc_name: str, type: str = Query("loaded")):
+    """删除指定的文件"""
     try:
-        # 移除已有的 .json 扩展名（如果有）然后添加一个
-        base_name = doc_name.replace('.json', '')
-        file_name = f"{base_name}.json"
-        
         # 根据类型选择不同的目录
-        directory = "01-loaded-docs" if type == "loaded" else "01-chunked-docs"
-        file_path = os.path.join(directory, file_name)
+        if type == "loaded":
+            directory = "01-loaded-docs"
+        elif type == "chunked":
+            directory = "01-chunked-docs"
+        elif type == "embedded":
+            directory = "02-embedded-docs"
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported document type: {type}")
+            
+        # 构建文件路径
+        file_path = os.path.join(directory, f"{doc_name}.json")
         
         logger.info(f"Attempting to delete document: {file_path}")
         
         if not os.path.exists(file_path):
             logger.error(f"Document not found at path: {file_path}")
-            raise HTTPException(status_code=404, detail="Document not found")
+            raise HTTPException(status_code=404, detail=f"File {doc_name} not found")
             
-        # 删除文件
         os.remove(file_path)
-        
-        return {
-            "status": "success",
-            "message": f"Document {doc_name} deleted successfully"
-        }
+        logger.info(f"Successfully deleted document: {file_path}")
+        return {"message": "File deleted successfully"}
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error deleting document: {str(e)}")
+        logger.error(f"Error deleting document {doc_name}: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/embedded-docs/{doc_name}")
+@router.get("/embedded-docs/{doc_name}")
 async def get_embedded_doc(doc_name: str):
     """Get specific embedded document"""
     try:
@@ -858,10 +831,13 @@ async def get_embedded_doc(doc_name: str):
                             "document_name": doc_data.get("document_name", doc_name),
                             "chunk_id": idx + 1,
                             "total_chunks": len(doc_data["embeddings"]),
-                            "content": embedding["metadata"].get("content", ""),
-                            "page_number": embedding["metadata"].get("page_number", ""),
-                            "page_range": embedding["metadata"].get("page_range", ""),
-                            # "chunking_method": embedding["metadata"].get("chunking_method", ""),
+                            "content": (
+                                embedding.get("metadata", {}).get("content")
+                                if embedding.get("metadata") and embedding["metadata"].get("content") is not None
+                                else embedding.get("text", "")
+                            ),
+                            "page_number": embedding.get("metadata", {}).get("page_number", ""),
+                            "page_range": embedding.get("metadata", {}).get("page_range", ""),
                             "embedding_model": doc_data.get("embedding_model", ""),
                             "embedding_provider": doc_data.get("embedding_provider", ""),
                             "embedding_timestamp": doc_data.get("created_at", ""),
@@ -877,7 +853,7 @@ async def get_embedded_doc(doc_name: str):
         logger.error(f"Error getting embedded document {doc_name}: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.delete("/embedded-docs/{doc_name}")
+@router.delete("/embedded-docs/{doc_name}")
 async def delete_embedded_doc(doc_name: str):
     """Delete specific embedded document"""
     try:
@@ -894,7 +870,7 @@ async def delete_embedded_doc(doc_name: str):
         logger.error(f"Error deleting embedded document {doc_name}: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/parse")
+@router.post("/parse")
 async def parse_file(
     file: UploadFile = File(...),
     loading_method: str = Form(...),
@@ -956,52 +932,70 @@ async def parse_file(
         logger.error(f"Error parsing file: {str(e)}")
         raise
 
-@app.post("/load")
+@router.post("/load")
 async def load_file(
     file: UploadFile = File(...),
     loading_method: str = Form(...),
     strategy: str = Form(None),
     chunking_strategy: str = Form(None),
-    chunking_options: str = Form(None)
+    chunking_options: str = Form(None),
+    file_type: str = Form(None)
 ):
+    """
+    支持 PDF、Netlist、LEF、LIB 等多种芯片设计文件类型的自动加载、分块和保存。
+    """
     try:
-        # 保存上传的文件
-        temp_path = os.path.join("temp", file.filename)
+        # 1. 保存上传的文件到临时目录
+        temp_dir = "temp"
+        os.makedirs(temp_dir, exist_ok=True)
+        temp_path = os.path.join(temp_dir, file.filename)
         with open(temp_path, "wb") as buffer:
             content = await file.read()
             buffer.write(content)
         
-        # 准备元数据
+        # 2. 准备元数据
         metadata = {
             "filename": file.filename,
-            "total_chunks": 0,  # 将在后面更新
-            "total_pages": 0,   # 将在后面更新
+            "total_chunks": 0,
+            "total_pages": 0,
             "loading_method": loading_method,
-            "loading_strategy": strategy,  
-            "chunking_strategy": chunking_strategy, 
-            "timestamp": datetime.now().isoformat()
+            "loading_strategy": strategy,
+            "chunking_strategy": chunking_strategy,
+            "timestamp": datetime.now().isoformat(),
+            "file_type": file_type
         }
         
-        # Parse chunking options if provided
+        # 3. 解析 chunking_options
         chunking_options_dict = None
         if chunking_options:
-            chunking_options_dict = json.loads(chunking_options)
+            try:
+                chunking_options_dict = json.loads(chunking_options)
+            except Exception:
+                chunking_options_dict = None
         
-        # 使用 LoadingService 加载文档
+        # 4. 加载文件内容
         loading_service = LoadingService()
-        raw_text = loading_service.load_pdf(
-            temp_path, 
-            loading_method, 
-            strategy=strategy,
-            chunking_strategy=chunking_strategy,
-            chunking_options=chunking_options_dict
-        )
+        if file_type == "pdf":
+            raw_text = loading_service.load_pdf(
+                temp_path, 
+                loading_method, 
+                strategy=strategy,
+                chunking_strategy=chunking_strategy,
+                chunking_options=chunking_options_dict
+            )
+        elif file_type == "netlist":
+            raw_text = loading_service.load_netlist(temp_path, loading_method)
+        elif file_type == "lef":
+            raw_text = loading_service.load_lef(temp_path)
+        elif file_type == "lib":
+            raw_text = loading_service.load_lib(temp_path)
+        else:
+            raise ValueError(f"Unsupported file type: {file_type}")
         
         metadata["total_pages"] = loading_service.get_total_pages()
-        
         page_map = loading_service.get_page_map()
         
-        # 转换成标准化的chunks格式
+        # 5. 构建 chunks
         chunks = []
         for idx, page in enumerate(page_map, 1):
             chunk_metadata = {
@@ -1012,13 +1006,13 @@ async def load_file(
             }
             if "metadata" in page:
                 chunk_metadata.update(page["metadata"])
-            
             chunks.append({
                 "content": page["text"],
                 "metadata": chunk_metadata
             })
+        metadata["total_chunks"] = len(chunks)
         
-        # 使用 LoadingService 保存文档，传递strategy参数
+        # 6. 保存到 01-loaded-docs
         filepath = loading_service.save_document(
             filename=file.filename,
             chunks=chunks,
@@ -1028,19 +1022,19 @@ async def load_file(
             chunking_strategy=chunking_strategy,
         )
         
-        # 读取保存的文档以返回
+        # 7. 读取保存的文档以返回
         with open(filepath, "r", encoding="utf-8") as f:
             document_data = json.load(f)
         
-        # 清理临时文件
+        # 8. 清理临时文件
         os.remove(temp_path)
         
         return {"loaded_content": document_data, "filepath": filepath}
     except Exception as e:
         logger.error(f"Error loading file: {str(e)}")
-        raise
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/chunk")
+@router.post("/chunk")
 async def chunk_document(data: dict = Body(...)):
     try:
         doc_id = data.get("doc_id")
@@ -1065,24 +1059,38 @@ async def chunk_document(data: dict = Body(...)):
                 detail=f"Unsupported document type: {doc_type}"
             )
             
-        file_path = os.path.join(directory, doc_id)
+        # 处理文件名，确保使用正确的扩展名
+        base_name = os.path.splitext(doc_id)[0]  # 移除任何现有的扩展名
+        file_path = os.path.join(directory, f"{base_name}.json")
         
         if not os.path.exists(file_path):
             raise HTTPException(status_code=404, detail=f"Document not found at {file_path}")
-            
+        
         with open(file_path, 'r', encoding='utf-8') as f:
             doc_data = json.load(f)
             
         # 构建页面映射
         page_map = []
         if doc_type == "loaded":
-            page_map = [
-                {
-                    'page': chunk['metadata']['page_number'],
-                    'text': chunk['content']
-                }
-                for chunk in doc_data['chunks']
-            ]
+            # 兼容chunks和content两种结构
+            if 'chunks' in doc_data:
+                page_map = [
+                    {
+                        'page': chunk['metadata']['page_number'],
+                        'text': chunk['content']
+                    }
+                    for chunk in doc_data['chunks']
+                ]
+            elif 'content' in doc_data:
+                page_map = [
+                    {
+                        'page': item.get('page', 0),
+                        'text': item['content']
+                    }
+                    for item in doc_data['content']
+                ]
+            else:
+                raise HTTPException(status_code=400, detail="文档不包含chunks或content字段")
         else:  # parsed
             # 检查是否是Verilog网表文件
             is_verilog = False
@@ -1162,7 +1170,8 @@ async def chunk_document(data: dict = Body(...)):
             
         # 准备元数据
         metadata = {
-            "filename": doc_data.get('filename', doc_id),
+            "file_name": doc_data.get('filename', doc_id),  # 新增，统一用 file_name
+            "filename": doc_data.get('filename', doc_id),   # 保留兼容
             "loading_method": doc_data.get('loading_method', 'parsed'),
             "total_pages": doc_data.get('total_pages', len(page_map))
         }
@@ -1198,7 +1207,7 @@ async def chunk_document(data: dict = Body(...)):
         logger.error(f"Error chunking document: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/evaluate")
+@router.post("/evaluate")
 async def evaluate_search(
     file: UploadFile = File(...),
     collection_id: str = Form(...),
@@ -1333,7 +1342,7 @@ async def evaluate_search(
         logger.error(f"Error during evaluation: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
     
-@app.post("/save-search")
+@router.post("/save-search")
 async def save_search_results(request: Request):
     try:
         data = await request.json()
@@ -1353,7 +1362,7 @@ async def save_search_results(request: Request):
         logger.error(f"Error saving search results: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/generation/models")
+@router.get("/generation/models")
 async def get_generation_models():
     """获取可用的生成模型列表"""
     try:
@@ -1469,7 +1478,7 @@ def split_content(content: str, max_chunk_size: int = MAX_CHUNK_SIZE) -> List[st
     
     return chunks
 
-@app.post("/generate")
+@router.post("/generate")
 async def generate(request: GenerationRequest = Body(..., max_size=MAX_CONTEXT_SIZE)):
     try:
         logger.info(f"收到生成请求: {request.dict()}")
@@ -1606,7 +1615,7 @@ async def generate(request: GenerationRequest = Body(..., max_size=MAX_CONTEXT_S
         logger.error(f"生成错误: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/search-results")
+@router.get("/search-results")
 async def list_search_results():
     """获取所有搜索结果文件列表"""
     try:
@@ -1634,7 +1643,7 @@ async def list_search_results():
         logger.error(f"Error listing search results: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/search-results/{file_id}")
+@router.get("/search-results/{file_id}")
 async def get_search_result(file_id: str):
     """获取特定搜索结果文件的内容"""
     try:
@@ -1650,7 +1659,7 @@ async def get_search_result(file_id: str):
         logger.error(f"Error reading search result file: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/indexing")
+@router.get("/indexing")
 async def list_embedding_files():
     """列出所有可用的嵌入文件"""
     try:
@@ -1724,7 +1733,7 @@ def get_available_collections():
 collections = get_available_collections()
 print(f"可用的集合：{collections}")
 
-@app.post("/upload-context")
+@router.post("/upload-context")
 async def upload_context(file: UploadFile = File(...)):
     """上传文件接口"""
     try:
@@ -1840,7 +1849,7 @@ async def upload_context(file: UploadFile = File(...)):
         logger.error(f"上传错误: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/files")
+@router.get("/files")
 async def list_files():
     """获取所有文件列表"""
     try:
@@ -1885,7 +1894,7 @@ async def list_files():
         logger.error(f"获取文件列表失败: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/files/{file_id}")
+@router.get("/files/{file_id}")
 async def get_file_content(file_id: str):
     """获取文件内容"""
     try:
@@ -1980,7 +1989,7 @@ async def get_file_content(file_id: str):
         logger.error(f"获取文件内容失败: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.delete("/files/{file_id}")
+@router.delete("/files/{file_id}")
 async def delete_file(file_id: str):
     """删除文件"""
     try:
@@ -2018,3 +2027,260 @@ async def delete_file(file_id: str):
     except Exception as e:
         logger.error(f"删除文件错误: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e)) 
+
+@router.post("/generate/stream")
+async def generate_stream(request: GenerationRequest = Body(..., max_size=MAX_CONTEXT_SIZE)):
+    """流式生成回答"""
+    try:
+        logger.info(f"收到流式生成请求: {request.dict()}")
+        
+        # 检查文件数量
+        if len(request.context_file_ids) > MAX_FILES:
+            raise HTTPException(status_code=400, detail=f"文件数量超过限制: 最多{MAX_FILES}个文件")
+        
+        # 读取上下文文件内容
+        context_contents = []
+        total_size = 0
+        total_chunks = 0
+        
+        if request.context_contents:  # 如果提供了context_contents，直接使用
+            for content in request.context_contents:
+                if content is None:
+                    continue
+                    
+                # 检查内容大小
+                content_size = len(content.encode('utf-8'))
+                if content_size > MAX_FILE_SIZE:
+                    # 如果内容超过单个文件限制，进行分块
+                    chunks = split_content(content)
+                    if len(chunks) > MAX_CHUNKS:
+                        raise HTTPException(status_code=400, detail=f"文件内容块数超过限制: 最多{MAX_CHUNKS}个块")
+                    
+                    total_chunks += len(chunks)
+                    if total_chunks > MAX_CHUNKS:
+                        raise HTTPException(status_code=400, detail=f"总块数超过限制: 最多{MAX_CHUNKS}个块")
+                    
+                    # 添加分块内容
+                    for i, chunk in enumerate(chunks):
+                        context_contents.append(f"=== 文件块 {i+1}/{len(chunks)} ===\n{chunk}\n=== 块结束 ===\n")
+                else:
+                    total_size += content_size
+                    if total_size > MAX_CONTEXT_SIZE:
+                        raise HTTPException(status_code=400, detail=f"总内容大小超过限制: 最多{MAX_CONTEXT_SIZE/1024/1024}MB")
+                    context_contents.append(content)
+        else:  # 否则从文件读取
+            for file_id in request.context_file_ids:
+                if file_id in file_storage:
+                    file_info = file_storage[file_id]
+                    try:
+                        # 检查文件大小
+                        file_size = Path(file_info["path"]).stat().st_size
+                        if file_size > MAX_FILE_SIZE:
+                            # 如果文件超过大小限制，进行分块读取
+                            chunks = []
+                            with open(file_info["path"], "r", encoding="utf-8") as f:
+                                content = f.read()
+                                chunks = split_content(content)
+                            
+                            if len(chunks) > MAX_CHUNKS:
+                                raise HTTPException(status_code=400, detail=f"文件内容块数超过限制: 最多{MAX_CHUNKS}个块")
+                            
+                            total_chunks += len(chunks)
+                            if total_chunks > MAX_CHUNKS:
+                                raise HTTPException(status_code=400, detail=f"总块数超过限制: 最多{MAX_CHUNKS}个块")
+                            
+                            # 添加分块内容
+                            for i, chunk in enumerate(chunks):
+                                context_contents.append(f"=== 文件: {file_info['name']} 块 {i+1}/{len(chunks)} ===\n{chunk}\n=== 块结束 ===\n")
+                        else:
+                            # 正常读取文件内容
+                            with open(file_info["path"], "r", encoding="utf-8") as f:
+                                content = f.read()
+                                content_size = len(content.encode('utf-8'))
+                                total_size += content_size
+                                if total_size > MAX_CONTEXT_SIZE:
+                                    raise HTTPException(status_code=400, detail=f"总内容大小超过限制: 最多{MAX_CONTEXT_SIZE/1024/1024}MB")
+                                
+                                context_contents.append(f"=== 文件: {file_info['name']} ===\n{content}\n=== 文件结束 ===\n")
+                        
+                        # 更新使用次数
+                        file_storage[file_id]["used_count"] += 1
+                    except Exception as e:
+                        logger.error(f"读取文件 {file_id} 失败: {str(e)}")
+                        raise HTTPException(status_code=500, detail=f"读取文件 {file_info['name']} 失败: {str(e)}")
+                else:
+                    logger.warning(f"文件 {file_id} 不存在")
+                    raise HTTPException(status_code=404, detail=f"文件 {file_id} 不存在")
+        
+        # 构建完整的上下文
+        full_context = "\n".join(context_contents)
+        
+        # 构建完整的提示词，包含上下文和问题
+        full_prompt = f"""你是一个专业的助手。请基于以下文件内容回答问题。如果文件内容中没有相关信息，请说明无法回答。
+注意：如果文件内容被分成了多个块，请确保查看所有相关块的内容。
+
+文件内容：
+{full_context}
+
+问题：
+{request.query}
+
+请提供详细的回答，并说明你的推理过程。如果回答涉及多个文件或文件块的内容，请明确指出信息来源。"""
+
+        # 创建一个异步生成器来流式返回响应
+        async def generate_response():
+            try:
+                # 根据不同的provider调用相应的API
+                if request.provider == "ollama":
+                    # 调用Ollama API
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(
+                            f"{OLLAMA_API_BASE}/api/generate",
+                            json={
+                                "model": request.model_name,
+                                "prompt": full_prompt,
+                                "stream": True
+                            }
+                        ) as response:
+                            if response.status != 200:
+                                error_text = await response.text()
+                                yield f"data: {json.dumps({'type': 'error', 'error': f'Ollama API错误: {error_text}'})}\n\n"
+                                return
+                            
+                            async for line in response.content:
+                                if line:
+                                    try:
+                                        data = json.loads(line)
+                                        if 'response' in data:
+                                            yield f"data: {json.dumps({'type': 'content', 'content': data['response']})}\n\n"
+                                        if data.get('done', False):
+                                            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                                    except json.JSONDecodeError:
+                                        continue
+                                        
+                elif request.provider == "openai":
+                    # 调用OpenAI API
+                    if not request.api_key:
+                        yield f"data: {json.dumps({'type': 'error', 'error': '未提供OpenAI API密钥'})}\n\n"
+                        return
+                        
+                    client = AsyncOpenAI(api_key=request.api_key)
+                    
+                    response = await client.chat.completions.create(
+                        model=request.model_name,
+                        messages=[
+                            {"role": "system", "content": "你是一个专业的助手，请基于提供的上下文回答问题。"},
+                            {"role": "user", "content": full_prompt}
+                        ],
+                        temperature=0.7,
+                        max_tokens=2000,
+                        stream=True
+                    )
+                    
+                    async for chunk in response:
+                        if chunk.choices[0].delta.content:
+                            yield f"data: {json.dumps({'type': 'content', 'content': chunk.choices[0].delta.content})}\n\n"
+                    
+                    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                else:
+                    yield f"data: {json.dumps({'type': 'error', 'error': f'不支持的provider: {request.provider}'})}\n\n"
+                    
+            except Exception as e:
+                logger.error(f"生成回答时出错: {str(e)}")
+                yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+        
+        # 返回流式响应
+        return StreamingResponse(
+            generate_response(),
+            media_type="text/event-stream"
+        )
+            
+    except HTTPException as he:
+        logger.error(f"生成错误 (HTTP): {he.detail}")
+        raise he
+    except Exception as e:
+        logger.error(f"生成错误: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/upload")
+async def upload_file(
+    file: UploadFile = File(...),
+    loading_method: str = Form(None),
+    parsing_option: str = Form(None),
+    file_type: str = Form(None)
+):
+    """
+    上传文件接口，兼容前端 /api/upload 调用
+    """
+    try:
+        # 检查是否已存在同名文件
+        for fid, info in file_storage.items():
+            if info["name"] == file.filename:
+                return {
+                    "file_id": fid,
+                    "filename": file.filename,
+                    "status": "exists"
+                }
+        # 生成唯一文件名
+        file_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{file.filename}"
+        save_path = UPLOAD_DIR / file_id
+        # 保存文件
+        with open(save_path, "wb") as f_out:
+            content = await file.read()
+            f_out.write(content)
+        # 写入 file_storage
+        file_storage[file_id] = {
+            "path": str(save_path),
+            "name": file.filename,
+            "size": len(content),
+            "upload_time": datetime.now(),
+            "status": "active",
+            "used_count": 0
+        }
+        # 保存 file_storage 到文件
+        with open(STORAGE_FILE, "w", encoding="utf-8") as f:
+            json.dump({k: {**v, "upload_time": v["upload_time"].isoformat()} for k, v in file_storage.items()}, f, ensure_ascii=False, indent=2)
+        return {
+            "file_id": file_id,
+            "filename": file.filename,
+            "status": "success"
+        }
+    except Exception as e:
+        logger.error(f"上传文件失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/chunked-files")
+async def get_chunked_files():
+    """
+    获取所有分块后的文件列表（01-chunked-docs 目录下的 .json 文件）
+    """
+    try:
+        chunked_dir = Path(__file__).parent / "01-chunked-docs"
+        if not chunked_dir.exists():
+            return {"files": []}
+        files = []
+        for file_path in chunked_dir.glob("*.json"):
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    metadata = data.get('metadata', {})
+                    files.append({
+                        'id': file_path.stem,
+                        'filename': metadata.get('filename', file_path.stem),
+                        'file_type': metadata.get('file_type', 'unknown'),
+                        'loading_method': metadata.get('loading_method', 'unknown'),
+                        'parsing_method': metadata.get('parsing_method', 'unknown'),
+                        'timestamp': metadata.get('timestamp', ''),
+                        'total_pages': metadata.get('total_pages', 0),
+                        'total_chunks': metadata.get('total_chunks', 0)
+                    })
+            except Exception as e:
+                logger.error(f"读取分块文件 {file_path} 失败: {str(e)}")
+                continue
+        return {"files": sorted(files, key=lambda x: x.get('timestamp', ''), reverse=True)}
+    except Exception as e:
+        logger.error(f"获取分块文件列表失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# 最后，将 router 添加到 app
+app.include_router(router)

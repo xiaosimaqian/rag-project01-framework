@@ -2,10 +2,11 @@
 import React, { useState, useEffect } from 'react';
 import RandomImage from '../components/RandomImage';
 import { apiBaseUrl } from '../config/config';
+import { Select } from 'antd';
 
 const Indexing = () => {
   const [embeddingFile, setEmbeddingFile] = useState('');
-  const [selectedProvider, setSelectedProvider] = useState('milvus');
+  const [selectedProvider, setSelectedProvider] = useState('milvus_lite');
   const [indexMode, setIndexMode] = useState('flat');
   const [status, setStatus] = useState('');
   const [embeddedFiles, setEmbeddedFiles] = useState([]);
@@ -13,16 +14,45 @@ const Indexing = () => {
   const [collections, setCollections] = useState([]);
   const [selectedCollection, setSelectedCollection] = useState('');
   const [collectionDetails, setCollectionDetails] = useState(null);
-  const [providers, setProviders] = useState(['milvus', 'chroma']);
+  const [providers, setProviders] = useState(['milvus_lite', 'milvus_standalone', 'milvus', 'chroma']);
   const [indexAction, setIndexAction] = useState('create');
 
   const dbConfigs = {
     milvus: {
       modes: ['flat', 'ivf_flat', 'ivf_sq8', 'hnsw', 'autoindex']
     },
+    milvus_lite: {
+      modes: ['flat', 'ivf_flat', 'ivf_sq8', 'hnsw', 'autoindex']
+    },
+    milvus_standalone: {
+      modes: ['flat', 'ivf_flat', 'ivf_sq8', 'hnsw', 'autoindex']
+    },
     chroma: {
       modes: ['hnsw']
     }
+  };
+
+  // 支持的索引类型映射
+  const indexModeOptionsMap = {
+    milvus_lite: [
+      { value: 'FLAT', label: 'FLAT' },
+      { value: 'IVF_FLAT', label: 'IVF_FLAT' },
+      { value: 'IVF_SQ8', label: 'IVF_SQ8' },
+      { value: 'IVF_PQ', label: 'IVF_PQ' },
+      { value: 'HNSW', label: 'HNSW' },
+    ],
+    milvus_standalone: [
+      { value: 'FLAT', label: 'FLAT' },
+      { value: 'IVF_FLAT', label: 'IVF_FLAT' },
+      { value: 'IVF_SQ8', label: 'IVF_SQ8' },
+      { value: 'IVF_PQ', label: 'IVF_PQ' },
+      { value: 'HNSW', label: 'HNSW' },
+      { value: 'BIN_FLAT', label: 'BIN_FLAT' },
+      { value: 'BIN_IVF_FLAT', label: 'BIN_IVF_FLAT' },
+    ],
+    chroma: [
+      // ...chroma 支持的索引类型
+    ]
   };
 
   const fetchEmbeddedFiles = async () => {
@@ -89,6 +119,16 @@ const Indexing = () => {
     setIndexingResult(null);
   }, [selectedProvider]);
 
+  // 在组件内部，获取当前 provider 支持的索引类型
+  const indexModeOptions = indexModeOptionsMap[selectedProvider] || [];
+
+  // 如果 provider 切换，自动重置 indexMode，防止选中不支持的类型
+  useEffect(() => {
+    if (indexModeOptions.length > 0 && !indexModeOptions.some(opt => opt.value === indexMode)) {
+      setIndexMode(indexModeOptions[0].value);
+    }
+  }, [selectedProvider]);
+
   const handleIndex = async () => {
     if (!embeddingFile) {
       setStatus('请选择嵌入向量文件');
@@ -103,21 +143,25 @@ const Indexing = () => {
     setIndexingResult(null);
 
     const payload = {
-      embeddingsFile: embeddingFile,
-      vectorDb: selectedProvider,
-      indexMode: indexMode,
-      action: indexAction,
-      targetCollectionName: indexAction === 'append' ? selectedCollection : null
+      document_name: embeddingFile.replace(/_embeddings\.json$/, ''),
+      provider: selectedProvider,
     };
+    if (indexAction === 'append' && selectedCollection) {
+      payload.target_collection_name = selectedCollection;
+    }
+
+    console.log('【前端】即将上传的 payload:', payload);
 
     try {
-      const response = await fetch(`${apiBaseUrl}/index`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(payload),
-      });
+      const response = await fetch(`${apiBaseUrl}/index?provider=${selectedProvider}&index_mode=${indexMode}`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(payload),
+        }
+      );
 
       const responseData = await response.json();
       console.log('Received response:', responseData);
@@ -282,34 +326,26 @@ const Indexing = () => {
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Vector Database</label>
+              <label className="block text-sm font-medium text-gray-700 mb-1">向量数据库</label>
               <select
                 value={selectedProvider}
                 onChange={(e) => setSelectedProvider(e.target.value)}
                 className="block w-full p-2 border border-gray-300 rounded-md shadow-sm focus:ring-indigo-500 focus:border-indigo-500"
               >
-                {providers.map(p => <option key={p} value={p}>{p.charAt(0).toUpperCase() + p.slice(1)}</option>)}
+                <option value="milvus_lite">Milvus Lite (本地)</option>
+                <option value="milvus_standalone">Milvus Standalone (服务)</option>
+                <option value="milvus">Milvus (兼容)</option>
+                <option value="chroma">Chroma</option>
               </select>
             </div>
 
              <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">Index Mode</label>
-              <select
+              <Select
                 value={indexMode}
-                onChange={(e) => setIndexMode(e.target.value)}
-                className="block w-full p-2 border border-gray-300 rounded-md shadow-sm focus:ring-indigo-500 focus:border-indigo-500"
-                disabled={!dbConfigs[selectedProvider]?.modes.length}
-              >
-                {dbConfigs[selectedProvider]?.modes.length > 0 ? (
-                    dbConfigs[selectedProvider].modes.map(mode => (
-                    <option key={mode} value={mode}>
-                        {mode.toUpperCase()}
-                    </option>
-                    ))
-                ) : (
-                    <option disabled>No modes available</option>
-                )}
-               </select>
+                onChange={setIndexMode}
+                options={indexModeOptions}
+              />
             </div>
 
             <div className="space-y-2">
@@ -423,7 +459,12 @@ const Indexing = () => {
                         <div className="space-y-3">
                             <div className="flex flex-col">
                                 <span className="text-sm text-gray-500">数据库类型</span>
-                                <span className="font-medium text-gray-900">{indexingResult.database || 'N/A'}</span>
+                                <span className="font-medium text-gray-900">{
+                                    indexingResult.provider
+                                    || indexingResult.database
+                                    || (indexingResult.formatted_info && indexingResult.formatted_info["基本信息"] && indexingResult.formatted_info["基本信息"]["数据库类型"])
+                                    || 'N/A'
+                                }</span>
                             </div>
                             <div className="flex flex-col">
                                 <span className="text-sm text-gray-500">集合名称</span>
@@ -436,8 +477,7 @@ const Indexing = () => {
                             <div className="flex flex-col">
                                 <span className="text-sm text-gray-500">创建时间</span>
                                 <span className="font-medium text-gray-900">
-                                    {indexingResult.creation_time ? 
-                                        new Date(indexingResult.creation_time).toLocaleString() : 'N/A'}
+                                    {indexingResult.creation_time || 'N/A'}
                                 </span>
                             </div>
                         </div>

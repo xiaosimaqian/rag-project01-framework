@@ -8,73 +8,127 @@ from utils.config import VectorDBProvider, MILVUS_CONFIG, CHROMA_CONFIG
 from fastapi import FastAPI, HTTPException
 import os
 import json
-from services.chroma_service import ChromaService
-from langchain_ollama import OllamaEmbeddings
+from pathlib import Path
+import chromadb
+from chromadb.config import Settings
+from langchain.embeddings import OllamaEmbeddings
 
 logger = logging.getLogger(__name__)
 
 class SearchService:
     """
-    搜索服务类，负责向量数据库的连接和向量搜索功能
-    提供集合列表查询、向量相似度搜索和搜索结果保存等功能
+    搜索服务类，提供向量搜索功能
     """
+    
     def __init__(self):
         """
         初始化搜索服务
-        创建嵌入服务实例，设置Milvus连接URI，初始化搜索结果保存目录
         """
-        self.embedding_service = EmbeddingService()
-        self.vector_store_service = VectorStoreService()
-        self.milvus_uri = MILVUS_CONFIG["uri"]
-        self.chroma_service = None
-        self.search_results_dir = "04-search-results"
-        os.makedirs(self.search_results_dir, exist_ok=True)
-    def _init_chroma_service(self):
+        self._chroma_client = None
+        self._embeddings = OllamaEmbeddings(
+            model="bge-m3:latest",
+            base_url="http://localhost:11434"
+        )
+    
+    def _init_chroma_client(self):
+        """初始化 Chroma 客户端"""
+        if self._chroma_client is None:
+            self._chroma_client = chromadb.Client(Settings(
+                chroma_db_impl="duckdb+parquet",
+                persist_directory=CHROMA_CONFIG.get("uri", "03-vector-store/chroma_db")
+            ))
+    
+    def search(self, query: str, collection_name: str, top_k: int = 5, threshold: float = 0.7) -> Dict:
         """
-        初始化 ChromaService
+        搜索相似文档
+        
+        参数:
+            query: 查询文本
+            collection_name: 集合名称
+            top_k: 返回结果数量
+            threshold: 相似度阈值
+            
+        返回:
+            搜索结果
         """
-        if self.chroma_service is None:
-            self.chroma_service = ChromaService()
-
-    async def search(
-        self,
-        query: str,
-        collection_name: str,
-        provider: str,
-        config: VectorDBConfig,
-        top_k: int = 3,
-        threshold: float = 0.7
-    ) -> Dict:
-        """执行搜索操作"""
         try:
-            logger.info(f"开始搜索，提供商: {provider}, 集合: {collection_name}")
+            # 获取查询向量
+            query_embedding = self._embeddings.embed_query(query)
             
-            # 获取原始文档使用的嵌入配置
-            embedding_config = self.embedding_service.get_document_embedding_config(collection_name)
+            # 初始化 Chroma 客户端
+            self._init_chroma_client()
+            collection = self._chroma_client.get_collection(collection_name)
             
-            # 生成查询向量
-            logger.info(f"使用 {embedding_config.provider} - {embedding_config.model_name} 生成查询向量")
-            query_vector = await self.embedding_service.create_single_embedding(
-                text=query,
-                config=embedding_config
+            # 执行搜索
+            results = collection.query(
+                query_embeddings=[query_embedding],
+                n_results=top_k
             )
             
-            if not query_vector:
-                raise ValueError("无法生成查询向量")
+            # 处理结果
+            processed_results = []
+            if results["documents"] and len(results["documents"]) > 0:
+                for i, doc in enumerate(results["documents"][0]):
+                    metadata = results["metadatas"][0][i] if results["metadatas"] else {}
+                    distance = float(results["distances"][0][i]) if results["distances"] else 0.0
+                    
+                    # 应用相似度阈值
+                    if distance <= threshold:
+                        processed_results.append({
+                            "document": doc,
+                            "distance": distance,
+                            "metadata": metadata
+                        })
             
-            # 执行向量搜索
-            results = self.vector_store_service.search(
-                collection_name=collection_name,
-                query_vector=query_vector,
-                top_k=top_k,
-                threshold=threshold
-            )
-            
-            return results
+            return {
+                "results": processed_results,
+                "total": len(processed_results)
+            }
             
         except Exception as e:
-            logger.error(f"搜索操作出错: {e}")
+            logger.error(f"搜索失败: {str(e)}")
             raise
+    
+    def list_collections(self) -> List[Dict[str, Any]]:
+        """
+        列出所有可用的集合
+        """
+        try:
+            self._init_chroma_client()
+            collections = []
+            for collection in self._chroma_client.list_collections():
+                collections.append({
+                    "id": collection.id,
+                    "name": collection.name,
+                    "count": collection.count(),
+                    "metadata": collection.metadata
+                })
+            return collections
+        except Exception as e:
+            logger.error(f"列出集合时出错: {e}")
+            raise
+
+    def get_document_embedding_config(self, collection_name: str) -> EmbeddingConfig:
+        """获取文档的嵌入配置"""
+        try:
+            # 从集合名称中提取嵌入模型信息
+            # 假设集合名称格式为: {doc_name}_by_{chunking_method}_{timestamp}
+            parts = collection_name.split('_by_')
+            if len(parts) >= 2:
+                # 使用默认配置
+                return EmbeddingConfig(
+                    provider="ollama",
+                    model_name="bge-m3:latest"
+                )
+            else:
+                raise ValueError(f"无法从集合名称 {collection_name} 中提取嵌入配置信息")
+        except Exception as e:
+            logger.error(f"获取文档嵌入配置失败: {e}")
+            # 返回默认配置
+            return EmbeddingConfig(
+                provider="ollama",
+                model_name="bge-m3:latest"
+            )
 
     def get_providers(self) -> List[Dict[str, str]]:
         """
@@ -94,55 +148,6 @@ class SearchService:
         except Exception as e:
             logger.error(f"Error getting providers: {str(e)}")
             raise HTTPException(status_code=500, detail=str(e))
-
-    def list_collections(self, provider: str = VectorDBProvider.MILVUS.value) -> List[Dict[str, Any]]:
-        """
-        获取指定向量数据库中的所有集合
-        
-        Args:
-            provider (str): 向量数据库提供商，默认为Milvus
-            
-        Returns:
-            List[Dict[str, Any]]: 集合信息列表，包含id、名称和实体数量
-            
-        Raises:
-            Exception: 连接或查询集合时发生错误
-        """
-        try:
-            if provider == VectorDBProvider.CHROMA.value:
-                # 使用 Chroma 获取集合列表
-                self._init_chroma_service()
-                return self.chroma_service.list_collections()
-            else:
-                # 使用 Milvus 获取集合列表
-                connections.connect(
-                    alias="default",
-                    uri=self.milvus_uri
-                )
-                
-                try:
-                    collections = []
-                    collection_names = utility.list_collections()
-                    
-                    for name in collection_names:
-                        try:
-                            collection = Collection(name)
-                            collections.append({
-                                "id": name,
-                                "name": name,
-                                "count": collection.num_entities
-                            })
-                        except Exception as e:
-                            logger.error(f"Error getting info for collection {name}: {str(e)}")
-                    
-                    return collections
-                    
-                finally:
-                    connections.disconnect("default")
-            
-        except Exception as e:
-            logger.error(f"Error listing collections: {str(e)}")
-            raise
 
     def save_search_results(self, query: str, collection_id: str, results: List[Dict[str, Any]]) -> str:
         """

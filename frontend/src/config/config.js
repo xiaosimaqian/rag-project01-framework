@@ -3,17 +3,17 @@ const env = import.meta.env.MODE || 'development';
 
 // API配置
 const config = {
-  development: {
-    apiBaseUrl: 'http://localhost:8001'  // 使用正确的端口8001
-  },
-  production: {
-    apiBaseUrl: 'http://api.example.com'
-  },
-  test: {
-    apiBaseUrl: 'http://localhost:8001'  // 使用正确的端口8001
-  }
-};
-
+              development: {
+    apiBaseUrl: '/api'  // 使用代理路径
+              },
+              production: {
+                apiBaseUrl: 'http://api.example.com'
+              },
+              test: {
+    apiBaseUrl: '/api'  // 使用代理路径
+              }
+            };
+            
 // 导出当前环境的配置
 const apiBaseUrl = config[env].apiBaseUrl;
 

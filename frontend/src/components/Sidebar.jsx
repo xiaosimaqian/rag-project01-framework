@@ -22,7 +22,7 @@ const Sidebar = () => {
                 }`
               }
             >
-              Load File
+              加载文件
             </NavLink>
           </li>
           <li>
@@ -36,7 +36,7 @@ const Sidebar = () => {
                 }`
               }
             >
-              Parse File
+              解析文件
             </NavLink>
           </li>
           <li>
@@ -50,7 +50,7 @@ const Sidebar = () => {
                 }`
               }
             >
-              Chunk File
+              分块文件
             </NavLink>
           </li>
           <li>
@@ -64,7 +64,7 @@ const Sidebar = () => {
                 }`
               }
             >
-              Embedding
+              向量化
             </NavLink>
           </li>
           <li>
@@ -78,7 +78,7 @@ const Sidebar = () => {
                 }`
               }
             >
-              Indexing
+              索引
             </NavLink>
           </li>
           <li>
@@ -92,7 +92,7 @@ const Sidebar = () => {
                 }`
               }
             >
-              Search
+              搜索
             </NavLink>
           </li>
           <li>
@@ -106,7 +106,21 @@ const Sidebar = () => {
                 }`
               }
             >
-              Generation
+              生成
+            </NavLink>
+          </li>
+          <li>
+            <NavLink 
+              to="/netlist-graph"
+              className={({ isActive }) => 
+                `block px-4 py-2 rounded-md ${
+                  isActive 
+                    ? 'bg-gray-700 text-white' 
+                    : 'text-gray-300 hover:bg-gray-700 hover:text-white'
+                }`
+              }
+            >
+              网表图分析
             </NavLink>
           </li>
         </ul>

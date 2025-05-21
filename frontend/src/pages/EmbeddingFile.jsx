@@ -1,111 +1,115 @@
 // src/pages/EmbeddingFile.jsx
 import React, { useState, useEffect } from 'react';
-import RandomImage from '../components/RandomImage';
+import { Button, message, Select, Space, Table, Modal, Input, Tag, Tooltip } from 'antd';
+import { DeleteOutlined, EyeOutlined, SearchOutlined, ReloadOutlined } from '@ant-design/icons';
 import { apiBaseUrl } from '../config/config';
 
 const EmbeddingFile = () => {
-  const [selectedDoc, setSelectedDoc] = useState('');
-  const [embeddingProvider, setEmbeddingProvider] = useState('openai');
-  const [embeddingModel, setEmbeddingModel] = useState('text-embedding-3-large');
-  const [status, setStatus] = useState('');
-  const [availableDocs, setAvailableDocs] = useState([]);
-  const [embeddedDocs, setEmbeddedDocs] = useState([]);
-  const [embeddings, setEmbeddings] = useState(null);
-  const [activeTab, setActiveTab] = useState('preview'); // 'preview' 或 'documents'
+  // 状态管理
+  const [selectedFile, setSelectedFile] = useState(null);
+  const [embeddingModel, setEmbeddingModel] = useState('text-embedding-3-small');
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [embeddedFiles, setEmbeddedFiles] = useState([]);
+  const [chunkedFiles, setChunkedFiles] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [searchText, setSearchText] = useState('');
+  const [previewVisible, setPreviewVisible] = useState(false);
+  const [previewFile, setPreviewFile] = useState(null);
+  const [embeddingTaskId, setEmbeddingTaskId] = useState(null);
+  const [isEmbeddingInProgress, setIsEmbeddingInProgress] = useState(false);
+  const [cancellationRequested, setCancellationRequested] = useState(false);
+  const [embeddingStatusMessage, setEmbeddingStatusMessage] = useState('');
 
-  const modelOptions = {
-    openai: [
-      { value: 'text-embedding-3-large', label: 'text-embedding-3-large' },
-      { value: 'text-embedding-3-small', label: 'text-embedding-3-small' }
-    ],
-    bedrock: [
-      { value: 'cohere.embed-english-v3', label: 'cohere.embed-english-v3' },
-      { value: 'cohere.embed-multilingual-v3', label: 'cohere.embed-multilingual-v3' }
-    ],
-    huggingface: [
-      { value: 'sentence-transformers/all-mpnet-base-v2', label: 'all-mpnet-base-v2' },
-      { value: 'all-MiniLM-L6-v2', label: 'all-MiniLM-L6-v2' },
-      { value: 'google-bert/bert-base-uncased', label: 'bert-base-uncased' }
-    ],
-    ollama: [
-      { value: 'bge-m3:latest', label: 'bge-m3:latest'},
-    ]
+  // 获取分块文件列表
+  const fetchChunkedFiles = async () => {
+    try {
+      const response = await fetch(`${apiBaseUrl}/chunked-files`);
+      if (!response.ok) {
+        throw new Error('获取分块文件列表失败');
+      }
+      const data = await response.json();
+      setChunkedFiles(data.files || []);
+    } catch (error) {
+      message.error(error.message);
+    }
   };
 
+  // 获取已嵌入文件列表
+  const fetchEmbeddedFiles = async () => {
+    console.log('fetchEmbeddedFiles called');
+    try {
+      setLoading(true);
+      const response = await fetch(`${apiBaseUrl}/list-embedded`);
+      if (!response.ok) {
+        throw new Error('获取已嵌入文件列表失败');
+      }
+      const data = await response.json();
+      if (data.documents) {
+        setEmbeddedFiles(data.documents.map(doc => ({
+          id: doc.name,
+          filename: doc.metadata.document_name || doc.name,
+          model: doc.metadata.embedding_model,
+          dimension: doc.metadata.vector_dimension,
+          vector_count: doc.metadata.total_vectors,
+          timestamp: doc.metadata.embedding_timestamp
+        })));
+      } else {
+        setEmbeddedFiles([]);
+      }
+    } catch (error) {
+      message.error(error.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // 初始加载和定期刷新文件列表
   useEffect(() => {
-    fetchAvailableDocs();
-    fetchEmbeddedDocs();
+    let isMounted = true;
+    let retryCount = 0;
+    const MAX_RETRIES = 3;
+    const RETRY_DELAY = 5000; // 5秒
+    const POLLING_INTERVAL = 60000; // 1分钟
+
+    const fetchData = async () => {
+      try {
+        if (isMounted) {
+          await fetchChunkedFiles();
+          await fetchEmbeddedFiles();
+          retryCount = 0; // 重置重试计数
+        }
+      } catch (error) {
+        console.error('Error fetching data:', error);
+        if (retryCount < MAX_RETRIES) {
+          retryCount++;
+          setTimeout(fetchData, RETRY_DELAY);
+        }
+      }
+    };
+
+    fetchData();
+    const timer = setInterval(fetchData, POLLING_INTERVAL);
+
+    return () => {
+      isMounted = false;
+      clearInterval(timer);
+    };
   }, []);
 
-  useEffect(() => {
-    setEmbeddingModel(modelOptions[embeddingProvider][0].value);
-  }, [embeddingProvider]);
-
-  const fetchAvailableDocs = async () => {
-    try {
-      console.log('开始获取文档列表...');
-      setStatus('正在获取文档列表...');
-      
-      const response = await fetch(`${apiBaseUrl}/documents?type=parsed`, {
-        headers: {
-          'Accept': 'application/json',
-          'Content-Type': 'application/json'
-        }
-      });
-      
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.detail || `HTTP error! status: ${response.status}`);
-      }
-      
-      console.log('API响应状态:', response.status);
-      const data = await response.json();
-      console.log('API响应数据:', data);
-      
-      if (!Array.isArray(data.documents)) {
-        console.error('文档数据不是数组格式:', data.documents);
-        setStatus('文档数据格式错误');
-        return;
-      }
-      
-      setAvailableDocs(data.documents);
-      setStatus('');
-    } catch (error) {
-      console.error('获取文档列表出错:', error);
-      setStatus('获取文档列表失败: ' + error.message);
-    }
-  };
-
-  const fetchEmbeddedDocs = async () => {
-    try {
-      setStatus('正在获取已嵌入文档列表...');
-      const response = await fetch(`${apiBaseUrl}/list-embedded`);
-      
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.detail || `HTTP error! status: ${response.status}`);
-      }
-      
-      const data = await response.json();
-      setEmbeddedDocs(data.documents);
-      setStatus('');
-    } catch (error) {
-      console.error('获取已嵌入文档列表出错:', error);
-      setStatus('获取已嵌入文档列表失败: ' + error.message);
-    }
-  };
-
+  // 处理文件嵌入
   const handleEmbed = async () => {
-    if (!selectedDoc) {
-      setStatus('请选择文档');
+    console.log('handleEmbed called, selectedFile:', selectedFile, 'embeddingModel:', embeddingModel);
+    if (!selectedFile) {
+      message.error('请选择要嵌入的文件');
       return;
     }
-    
-    // 移除 .json 扩展名
-    const docName = selectedDoc.replace('.json', '');
-    
-    setStatus('正在处理中...');
+    setIsProcessing(true);
+    setIsEmbeddingInProgress(true);
+    setCancellationRequested(false);
+    setEmbeddingTaskId(null);
+    setEmbeddingStatusMessage('开始嵌入处理...');
     try {
+      const docName = selectedFile.endsWith('.json') ? selectedFile.slice(0, -5) : selectedFile;
       const response = await fetch(`${apiBaseUrl}/embed`, {
         method: 'POST',
         headers: {
@@ -113,257 +117,329 @@ const EmbeddingFile = () => {
         },
         body: JSON.stringify({
           docName: docName,
-          docType: 'chunked',
+          docType: "chunked",
           embeddingConfig: {
-            provider: embeddingProvider,
+            provider: "ollama",
             model: embeddingModel
           }
         }),
       });
-      
+
       if (!response.ok) {
         const errorData = await response.json();
-        throw new Error(errorData.detail || '创建嵌入失败');
+        throw new Error(errorData.detail || '文件嵌入失败');
       }
-      
-      const data = await response.json();
-      setEmbeddings(data.embeddings);
-      setStatus(`嵌入完成! 已保存到: ${data.filepath}`);
-      fetchEmbeddedDocs(); // 刷新嵌入文档列表
+
+      const result = await response.json();
+      if (result.status === 'success') {
+        message.success('文件嵌入成功');
+        setEmbeddingStatusMessage('文件嵌入成功');
+      } else {
+        setEmbeddingStatusMessage('嵌入请求已发送，请稍后查看结果。');
+      }
     } catch (error) {
-      console.error('错误:', error);
-      setStatus('创建嵌入时出错: ' + error.message);
+      console.error('Error:', error);
+      message.error(error.message);
+      setEmbeddingStatusMessage(`嵌入失败: ${error.message}`);
+    } finally {
+      setIsProcessing(false);
+      setIsEmbeddingInProgress(false);
+      setEmbeddingTaskId(null);
     }
   };
 
-  const handleDeleteEmbedding = async (docName) => {
+  const handleCancelEmbedding = async () => {
+    if (!embeddingTaskId) {
+      message.error('没有正在进行的嵌入任务可中止。');
+      return;
+    }
+    if (cancellationRequested) {
+      message.info('取消请求已发送。');
+      return;
+    }
+    setEmbeddingStatusMessage(`正在请求中止任务 ${embeddingTaskId}...`);
+    setCancellationRequested(true);
     try {
-      const response = await fetch(`${apiBaseUrl}/embedded-docs/${docName}`, {
-        method: 'DELETE',
+      const response = await fetch(`${apiBaseUrl}/embedding/cancel/${embeddingTaskId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
       });
-
+      const result = await response.json();
       if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+        throw new Error(result.detail || `中止嵌入任务失败 (状态 ${response.status})`);
       }
-
-      setStatus('Embedding deleted successfully');
-      fetchEmbeddedDocs();
-      if (embeddings && selectedDoc === docName) {
-        setEmbeddings(null);
-      }
+      message.success(result.message || `任务 ${embeddingTaskId} 的中止请求已成功发送。`);
+      setEmbeddingStatusMessage(result.message || `任务 ${embeddingTaskId} 中止请求已发送。后端将在处理完当前块后停止。`);
+      setIsEmbeddingInProgress(false);
+      setEmbeddingTaskId(null);
     } catch (error) {
-      console.error('Error deleting embedding:', error);
-      setStatus(`Error deleting embedding: ${error.message}`);
+      message.error(`中止嵌入失败: ${error.message}`);
+      setEmbeddingStatusMessage(`中止嵌入任务 ${embeddingTaskId} 失败: ${error.message}`);
+      setCancellationRequested(false);
     }
   };
 
-  const handleViewEmbedding = async (docName) => {
+  // 预览嵌入内容
+  const handlePreview = async (file) => {
     try {
-      setStatus('Loading embedding...');
-      const response = await fetch(`${apiBaseUrl}/embedded-docs/${docName}`);
+      const response = await fetch(`${apiBaseUrl}/embedded-docs/${file.id}`);
       if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+        throw new Error('获取嵌入内容失败');
       }
       const data = await response.json();
-      setEmbeddings(data.embeddings);
-      setActiveTab('preview');
-      setStatus('');
+      
+      // 检查数据格式
+      if (!data || !data.embeddings || !Array.isArray(data.embeddings)) {
+        throw new Error('无效的嵌入数据格式');
+      }
+
+      // 构建预览数据
+      setPreviewFile({
+        metadata: {
+          filename: file.filename,
+          model: file.model,
+          dimension: file.dimension,
+          vector_count: file.vector_count,
+          timestamp: file.timestamp
+        },
+        vectors: data.embeddings.map((embedding, index) => ({
+          dimension: embedding.dimension || file.dimension,
+          content: (embedding.metadata && embedding.metadata.content) || embedding.content || embedding.text || `向量 ${index + 1}`
+        }))
+      });
+      setPreviewVisible(true);
     } catch (error) {
-      console.error('Error loading embedding:', error);
-      setStatus(`Error loading embedding: ${error.message}`);
+      message.error(error.message);
     }
   };
 
-  const renderRightPanel = () => {
-    return (
-      <div className="p-4">
-        {/* 标签页切换 */}
-        <div className="flex mb-4 border-b">
-          <button
-            className={`px-4 py-2 ${
-              activeTab === 'preview'
-                ? 'border-b-2 border-blue-500 text-blue-600'
-                : 'text-gray-600'
-            }`}
-            onClick={() => setActiveTab('preview')}
-          >
-            Embedding Preview
-          </button>
-          <button
-            className={`px-4 py-2 ml-4 ${
-              activeTab === 'documents'
-                ? 'border-b-2 border-blue-500 text-blue-600'
-                : 'text-gray-600'
-            }`}
-            onClick={() => setActiveTab('documents')}
-          >
-            Embedding Management
-          </button>
-        </div>
+  // 删除嵌入文件
+  const handleDelete = (file) => {
+    Modal.confirm({
+      title: '确认删除',
+      content: `确定要删除文件 "${file.filename}" 的嵌入结果吗？`,
+      okText: '确认',
+      okType: 'danger',
+      cancelText: '取消',
+      onOk: async () => {
+        try {
+          const response = await fetch(`${apiBaseUrl}/documents/${file.id}?type=embedded`, {
+            method: 'DELETE',
+          });
+          if (!response.ok) {
+            throw new Error('删除嵌入文件失败');
+          }
+          message.success('嵌入文件删除成功');
+          fetchEmbeddedFiles();
+        } catch (error) {
+          message.error(error.message);
+        }
+      },
+    });
+  };
 
-        {activeTab === 'preview' ? (
-          embeddings ? (
-            <div>
-              <h3 className="text-xl font-semibold mb-4">Embedding Results</h3>
-              <div className="space-y-3 max-h-[calc(100vh-300px)] overflow-y-auto">
-                {embeddings.map((embedding, idx) => (
-                  <div key={idx} className="p-3 border rounded bg-gray-50">
-                    <div className="font-medium text-sm text-gray-500 mb-1">
-                      Chunk {embedding.metadata.chunk_id} of {embedding.metadata.total_chunks}
-                    </div>
-                    <div className="text-xs text-gray-400 mb-2">
-                      Document: {embedding.metadata.filename || embedding.metadata.document_name || 'N/A'} | 
-                      Page: {embedding.metadata.page_number || 'N/A'} | 
-                      Page Range: {embedding.metadata.page_range || 'N/A'}
-                    </div>
-                    <div className="text-xs text-gray-400 mb-2">
-                      Model: {embedding.metadata.embedding_model || 'N/A'} | 
-                      Provider: {embedding.metadata.embedding_provider || 'N/A'} | 
-                      Dimension: {embedding.metadata.vector_dimension || 'N/A'} |
-                      Timestamp: {new Date(embedding.metadata.embedding_timestamp).toLocaleString()}
-                    </div>
-                    <div className="text-sm mt-2">
-                      <div className="font-medium text-gray-600">Content:</div>
-                      <div className="text-gray-600">{embedding.metadata.content || 'N/A'}</div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          ) : (
-            <RandomImage message="Select a document and generate embeddings or view existing embeddings" />
-          )
-        ) : (
-          // 嵌入文档管理页面
-          <div>
-            <h3 className="text-xl font-semibold mb-4">Embedding Management</h3>
+  // 表格列定义
+  const columns = [
+    {
+      title: '文件名',
+      dataIndex: 'filename',
+      key: 'filename',
+      render: (text) => <span className="font-medium">{text}</span>,
+    },
+    {
+      title: '嵌入模型',
+      dataIndex: 'model',
+      key: 'model',
+      render: (model) => <Tag color="blue">{model}</Tag>,
+    },
+    {
+      title: '向量维度',
+      dataIndex: 'dimension',
+      key: 'dimension',
+      render: (dim) => <Tag>{dim}</Tag>,
+    },
+    {
+      title: '向量数量',
+      dataIndex: 'vector_count',
+      key: 'vector_count',
+      render: (count) => <Tag color="green">{count}</Tag>,
+    },
+    {
+      title: '处理时间',
+      dataIndex: 'timestamp',
+      key: 'timestamp',
+      render: (timestamp) => new Date(timestamp).toLocaleString(),
+    },
+    {
+      title: '操作',
+      key: 'action',
+      render: (_, record) => (
+        <Space>
+          <Tooltip title="预览">
+            <Button
+              type="text"
+              icon={<EyeOutlined />}
+              onClick={() => handlePreview(record)}
+            />
+          </Tooltip>
+          <Tooltip title="删除">
+            <Button
+              type="text"
+              danger
+              icon={<DeleteOutlined />}
+              onClick={() => handleDelete(record)}
+            />
+          </Tooltip>
+        </Space>
+      ),
+    },
+  ];
+
+  // 过滤文件列表
+  const filteredFiles = embeddedFiles.filter((file) =>
+    file.filename.toLowerCase().includes(searchText.toLowerCase())
+  );
+
+  return (
+    <div className="p-6">
+      <h2 className="text-2xl font-bold mb-6">文本嵌入</h2>
+
+      <div className="grid grid-cols-12 gap-6">
+        {/* 左侧面板 (3/12) */}
+        <div className="col-span-3 space-y-4">
+          <div className="p-4 border rounded-lg bg-white shadow-sm">
             <div className="space-y-4">
-              {embeddedDocs.map((doc) => (
-                <div key={doc.name} className="p-4 border rounded-lg bg-gray-50">
-                  <div className="flex justify-between items-start">
-                    <div>
-                      <h4 className="font-medium text-lg">{doc.name}</h4>
-                      <div className="text-sm text-gray-600 mt-1">
-                        <p>Model: {doc.metadata?.embedding_model}</p>
-                        <p>Provider: {doc.metadata?.embedding_provider}</p>
-                        <p>Created: {new Date(doc.metadata?.embedding_timestamp).toLocaleString()}</p>
-                      </div>
-                    </div>
-                    <div className="flex space-x-2">
-                      <button
-                        onClick={() => handleViewEmbedding(doc.name)}
-                        className="px-3 py-1 bg-blue-500 text-white rounded hover:bg-blue-600"
-                      >
-                        View
-                      </button>
-                      <button
-                        onClick={() => handleDeleteEmbedding(doc.name)}
-                        className="px-3 py-1 bg-red-500 text-white rounded hover:bg-red-600"
-                      >
-                        Delete
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              ))}
-              {embeddedDocs.length === 0 && (
-                <div className="text-center text-gray-500 py-8">
-                  No embedded documents available
+              <div>
+                <label htmlFor="select-file-for-embedding" className="block text-sm font-medium mb-1">选择文件</label>
+                <Select
+                  id="select-file-for-embedding"
+                  value={selectedFile}
+                  onChange={setSelectedFile}
+                  className="w-full"
+                  placeholder="请选择要嵌入的文件"
+                  loading={loading}
+                >
+                  {chunkedFiles.map((file) => (
+                    <Select.Option key={file.id} value={file.id}>
+                      {file.name}
+                    </Select.Option>
+                  ))}
+                </Select>
+              </div>
+
+              <div>
+                <label htmlFor="select-embedding-model" className="block text-sm font-medium mb-1">嵌入模型</label>
+                <Select
+                  id="select-embedding-model"
+                  value={embeddingModel}
+                  onChange={setEmbeddingModel}
+                  className="w-full"
+                >
+                  <Select.Option value="text-embedding-3-small">text-embedding-3-small</Select.Option>
+                  <Select.Option value="text-embedding-3-large">text-embedding-3-large</Select.Option>
+                  <Select.Option value="text-embedding-ada-002">text-embedding-ada-002</Select.Option>
+                  <Select.Option value="bge-m3:latest">bge-m3:latest (Ollama)</Select.Option>
+                </Select>
+              </div>
+
+              <Button
+                type="primary"
+                onClick={handleEmbed}
+                loading={isEmbeddingInProgress && !cancellationRequested}
+                disabled={!selectedFile || isEmbeddingInProgress}
+                block
+              >
+                {isEmbeddingInProgress ? '处理中...' : '开始嵌入'}
+              </Button>
+              <Button
+                type="default"
+                danger
+                onClick={handleCancelEmbedding}
+                disabled={!isEmbeddingInProgress || !embeddingTaskId || cancellationRequested}
+                block
+              >
+                中止嵌入
+              </Button>
+              {embeddingStatusMessage && (
+                <div style={{ marginTop: 10 }}>
+                  <span>{embeddingStatusMessage}</span>
                 </div>
               )}
             </div>
           </div>
-        )}
-      </div>
-    );
-  };
+        </div>
 
-  return (
-    <div className="p-6">
-      <h2 className="text-2xl font-bold mb-6">Embedding File</h2>
-      
-      <div className="grid grid-cols-12 gap-6">
-        {/* Left Panel */}
-        <div className="col-span-3 space-y-4">
-          <div className="p-4 border rounded-lg bg-white shadow-sm">
-            <div>
-              <label className="block text-sm font-medium mb-1">选择文档</label>
-              <div className="text-sm text-gray-500 mb-2">
-                可用文档数量: {availableDocs.length}
+        {/* 右侧面板 (9/12) */}
+        <div className="col-span-9 space-y-4">
+          {/* 已嵌入文件列表 */}
+          <div className="border rounded-lg bg-white shadow-sm">
+            <div className="p-4 border-b">
+              <div className="flex justify-between items-center">
+                <h3 className="text-lg font-semibold">已嵌入文件</h3>
+                <Space>
+                  <Input
+                    id="embedding-file-search-input"
+                    placeholder="搜索文件..."
+                    prefix={<SearchOutlined />}
+                    value={searchText}
+                    onChange={(e) => setSearchText(e.target.value)}
+                    style={{ width: 200 }}
+                  />
+                  <Button
+                    icon={<ReloadOutlined />}
+                    onClick={fetchEmbeddedFiles}
+                    loading={loading}
+                  />
+                </Space>
               </div>
-              <select
-                value={selectedDoc}
-                onChange={(e) => setSelectedDoc(e.target.value)}
-                className="block w-full p-2 border rounded"
-                disabled={status.includes('正在处理中')}
-              >
-                <option value="">选择文档...</option>
-                {availableDocs.map(doc => (
-                  <option key={doc.id} value={doc.name}>
-                    {doc.name} ({doc.type})
-                  </option>
-                ))}
-              </select>
             </div>
-
-            <div className="mt-4">
-              <label className="block text-sm font-medium mb-1">嵌入提供者</label>
-              <select
-                value={embeddingProvider}
-                onChange={(e) => setEmbeddingProvider(e.target.value)}
-                className="block w-full p-2 border rounded"
-                disabled={status.includes('正在处理中')}
-              >
-                <option value="openai">OpenAI</option>
-                <option value="bedrock">Bedrock</option>
-                <option value="huggingface">HuggingFace</option>
-                <option value="ollama">Ollama</option>
-              </select>
-            </div>
-
-            <div className="mt-4">
-              <label className="block text-sm font-medium mb-1">模型</label>
-              <select
-                value={embeddingModel}
-                onChange={(e) => setEmbeddingModel(e.target.value)}
-                className="block w-full p-2 border rounded"
-                disabled={status.includes('正在处理中')}
-              >
-                {modelOptions[embeddingProvider].map(model => (
-                  <option key={model.value} value={model.value}>
-                    {model.label}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <button 
-              onClick={handleEmbed}
-              className={`mt-4 w-full px-4 py-2 text-white rounded ${
-                status.includes('正在处理中')
-                  ? 'bg-gray-400 cursor-not-allowed'
-                  : 'bg-blue-500 hover:bg-blue-600'
-              }`}
-              disabled={!selectedDoc || status.includes('正在处理中')}
-            >
-              {status.includes('正在处理中') ? '处理中...' : '生成嵌入'}
-            </button>
+            <Table
+              columns={columns}
+              dataSource={filteredFiles}
+              rowKey={(record) => record.id || record.filename || Math.random().toString(36).substr(2, 9)}
+              loading={loading}
+              pagination={{
+                defaultPageSize: 10,
+                showSizeChanger: true,
+                showTotal: (total) => `共 ${total} 个文件`,
+              }}
+            />
           </div>
-
-          {status && (
-            <div className={`p-4 rounded-lg ${
-              status.includes('错误') ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'
-            }`}>
-              {status}
-            </div>
-          )}
-        </div>
-
-        {/* Right Panel */}
-        <div className="col-span-9 border rounded-lg bg-white shadow-sm">
-          {renderRightPanel()}
         </div>
       </div>
+
+      {/* 嵌入预览模态框 */}
+      <Modal
+        title="嵌入预览"
+        open={previewVisible}
+        onCancel={() => setPreviewVisible(false)}
+        width={800}
+        footer={null}
+      >
+        {previewFile && (
+          <div className="max-h-[calc(100vh-200px)] overflow-y-auto">
+            <div className="mb-4 p-3 border rounded bg-gray-100">
+              <h4 className="font-medium mb-2">文件信息</h4>
+              <div className="text-sm text-gray-600">
+                <p>文件名: {previewFile.metadata?.filename}</p>
+                <p>嵌入模型: {previewFile.metadata?.model}</p>
+                <p>向量维度: {previewFile.metadata?.dimension}</p>
+                <p>向量数量: {previewFile.metadata?.vector_count}</p>
+                <p>处理时间: {previewFile.metadata?.timestamp && new Date(previewFile.metadata.timestamp).toLocaleString()}</p>
+              </div>
+            </div>
+            <div className="space-y-3">
+              {previewFile.vectors.map((vector, idx) => (
+                <div key={idx} className="p-4 border rounded-lg bg-white shadow-sm">
+                  <h3 className="text-lg font-semibold mb-2">向量 {idx + 1}</h3>
+                  <p className="text-sm text-gray-500">维度: {vector.dimension}</p>
+                  <p className="text-sm text-gray-500 mt-2">内容: {vector.content}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </Modal>
     </div>
   );
 };

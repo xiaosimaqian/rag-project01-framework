@@ -1,8 +1,18 @@
 import logging
-from typing import Dict, List
+from typing import Dict, List, Optional
 import fitz  # PyMuPDF
 import pandas as pd
 from datetime import datetime
+from .netlist_graph_service import NetlistGraphService
+from pathlib import Path
+import sys
+import os
+
+# 添加项目根目录到 Python 路径
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from parser_config import PARSER_CONFIG, CACHE_CONFIG, ERROR_CONFIG, PERFORMANCE_CONFIG
+from parser import Parser
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +27,54 @@ class ParsingService:
     - 文本和表格混合解析
     - 芯片物理设计文件解析（Netlist、LEF、LIB）
     """
+
+    def __init__(self):
+        """初始化解析服务"""
+        self.netlist_graph_service = NetlistGraphService()
+        self._parser = Parser()
+        self._parser_cache = {}
+        self._last_modified = {}
+        self._cache_enabled = CACHE_CONFIG['enabled']
+        self._max_cache_size = CACHE_CONFIG['max_size']
+        self._cache_ttl = CACHE_CONFIG['ttl']
+
+    def _get_cache_key(self, text: str, method: str) -> str:
+        """生成缓存键"""
+        return f"{hash(text)}_{method}"
+        
+    def _check_cache(self, cache_key: str, text: str) -> bool:
+        """检查缓存是否有效"""
+        if not self._cache_enabled:
+            return False
+            
+        if cache_key not in self._parser_cache:
+            return False
+            
+        if cache_key not in self._last_modified:
+            return False
+            
+        # 检查缓存是否过期
+        now = datetime.now()
+        last_modified = self._last_modified[cache_key]
+        if (now - last_modified).total_seconds() > self._cache_ttl:
+            return False
+            
+        return True
+        
+    def _update_cache(self, cache_key: str, result: dict):
+        """更新缓存"""
+        if not self._cache_enabled:
+            return
+            
+        # 检查缓存大小
+        if len(self._parser_cache) >= self._max_cache_size:
+            # 删除最旧的缓存
+            oldest_key = min(self._last_modified.items(), key=lambda x: x[1])[0]
+            del self._parser_cache[oldest_key]
+            del self._last_modified[oldest_key]
+            
+        self._parser_cache[cache_key] = result
+        self._last_modified[cache_key] = datetime.now()
 
     def parse_document(self, text: str, method: str, metadata: dict, page_map: list = None) -> dict:
         """
@@ -66,12 +124,18 @@ class ParsingService:
             dict: 解析后的文档数据
         """
         try:
+            cache_key = self._get_cache_key(text, method)
+            
+            # 检查缓存
+            if self._check_cache(cache_key, text):
+                return self._parser_cache[cache_key]
+                
             parsed_content = []
             
             if method == "all_text":
                 parsed_content = self._parse_all_text(page_map)
-            elif method == "by_modules":
-                parsed_content = self._parse_by_modules(page_map)
+            elif method == "by_module":
+                parsed_content = self._parse_by_module(page_map)
             elif method == "by_ports":
                 parsed_content = self._parse_by_ports(page_map)
             elif method == "by_instances":
@@ -80,12 +144,28 @@ class ParsingService:
                 parsed_content = self._parse_by_pins_netlist(page_map)
             elif method == "by_nets":
                 parsed_content = self._parse_by_nets(page_map)
+            elif method == "by_graph":
+                # 使用图分析服务解析网表
+                self.netlist_graph_service.parse_netlist(text)
+                analysis_result = self.netlist_graph_service.analyze_graph()
+                parsed_content = analysis_result
+                
+                # 生成可视化
+                output_dir = Path("visualizations")
+                output_dir.mkdir(exist_ok=True)
+                output_path = output_dir / f"{metadata.get('filename', 'netlist')}_graph.png"
+                self.netlist_graph_service.visualize(str(output_path))
+                
+                # 保存图结构
+                graph_path = output_dir / f"{metadata.get('filename', 'netlist')}_graph.json"
+                self.netlist_graph_service.save_graph(str(graph_path))
             else:
                 raise ValueError(f"Unsupported parsing method for netlist: {method}")
                 
             document_data = {
                 "metadata": {
                     "filename": metadata.get("filename", ""),
+                    "loading_method": metadata.get("loading_method", "unknown"),
                     "total_modules": len(parsed_content),
                     "parsing_method": method,
                     "timestamp": datetime.now().isoformat()
@@ -93,10 +173,28 @@ class ParsingService:
                 "content": parsed_content
             }
             
+            # 更新缓存
+            self._update_cache(cache_key, document_data)
+            
             return document_data
             
         except Exception as e:
-            logger.error(f"Error in parse_netlist: {str(e)}")
+            error_info = {
+                "error_type": type(e).__name__,
+                "error_message": str(e),
+                "method": method,
+                "filename": metadata.get("filename", "")
+            }
+            
+            if ERROR_CONFIG['include_stack_trace']:
+                import traceback
+                error_info['stack_trace'] = traceback.format_exc()
+                
+            logger.error(f"Error in parse_netlist: {error_info}")
+            
+            if len(str(e)) > ERROR_CONFIG['max_error_length']:
+                error_info['error_message'] = str(e)[:ERROR_CONFIG['max_error_length']] + "..."
+                
             raise
             
     def parse_lef(self, text: str, method: str, metadata: dict, page_map: list) -> dict:
@@ -127,6 +225,7 @@ class ParsingService:
             document_data = {
                 "metadata": {
                     "filename": metadata.get("filename", ""),
+                    "loading_method": metadata.get("loading_method", "unknown"),
                     "total_sections": len(parsed_content),
                     "parsing_method": method,
                     "timestamp": datetime.now().isoformat()
@@ -168,6 +267,7 @@ class ParsingService:
             document_data = {
                 "metadata": {
                     "filename": metadata.get("filename", ""),
+                    "loading_method": metadata.get("loading_method", "unknown"),
                     "total_cells": len(parsed_content),
                     "parsing_method": method,
                     "timestamp": datetime.now().isoformat()
@@ -180,7 +280,7 @@ class ParsingService:
         except Exception as e:
             logger.error(f"Error in parse_lib: {str(e)}")
             raise
-            
+
     def parse_pdf(self, text: str, method: str, metadata: dict, page_map: list = None) -> dict:
         """
         使用指定方法解析PDF文档
@@ -219,6 +319,7 @@ class ParsingService:
             document_data = {
                 "metadata": {
                     "filename": metadata.get("filename", ""),
+                    "loading_method": metadata.get("loading_method", "unknown"),
                     "total_pages": total_pages,
                     "parsing_method": method,
                     "timestamp": datetime.now().isoformat()
@@ -233,20 +334,22 @@ class ParsingService:
             raise
 
     def _parse_all_text(self, page_map: list) -> list:
-        """
-        将文档中的所有文本内容提取为连续流
-
-        参数:
-            page_map (list): 包含每页内容的字典列表
-
-        返回:
-            list: 包含带页码的文本内容的字典列表
-        """
-        return [{
-            "type": "Text",
-            "content": page["text"],
-            "page": page["page"]
-        } for page in page_map]
+        """解析所有文本内容"""
+        if PERFORMANCE_CONFIG['use_incremental_parsing']:
+            return self._parse_incremental(page_map)
+        return [{"type": "text", "content": page["text"], "page": page["page"]} for page in page_map]
+        
+    def _parse_incremental(self, page_map: list) -> list:
+        """增量解析"""
+        batch_size = PERFORMANCE_CONFIG['batch_size']
+        parsed_content = []
+        
+        for i in range(0, len(page_map), batch_size):
+            batch = page_map[i:i + batch_size]
+            batch_content = [{"type": "text", "content": page["text"], "page": page["page"]} for page in batch]
+            parsed_content.extend(batch_content)
+            
+        return parsed_content
 
     def _parse_by_pages(self, page_map: list) -> list:
         """
@@ -344,7 +447,7 @@ class ParsingService:
                 })
         return parsed_content
 
-    def _parse_by_modules(self, page_map: list) -> list:
+    def _parse_by_module(self, page_map: list) -> list:
         """按模块解析 Netlist"""
         return [{
             "type": "module",

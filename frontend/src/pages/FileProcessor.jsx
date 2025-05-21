@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Button, message, Select, Space, Empty, Table, Modal, Input, Tag, Tooltip, Steps, Upload, Form } from 'antd';
+import { Button, message, Select, Space, Empty, Table, Modal, Input, Tag, Tooltip, Steps, Upload, Form, Card, Alert, Spin } from 'antd';
 import { DeleteOutlined, EyeOutlined, SearchOutlined, ReloadOutlined, UploadOutlined, FileTextOutlined, CheckCircleOutlined, InboxOutlined } from '@ant-design/icons';
 import { apiBaseUrl } from '../config/config';
 
@@ -24,42 +24,29 @@ const FileProcessor = () => {
   const [loadingTools, setLoadingTools] = useState([]);
   const [parsingOptions, setParsingOptions] = useState([]);
 
+  // 错误处理
+  const [fileLoadError, setFileLoadError] = useState(null);
+  const [lastUpdate, setLastUpdate] = useState(null);
+  const CACHE_DURATION = 300000; // 5分钟缓存
+
   // 获取已处理文件列表
-  const fetchParsedFiles = async () => {
+  const fetchParsedFiles = async (force = false) => {
     try {
       setLoading(true);
-      const response = await fetch(`${apiBaseUrl}/documents`);
+      setFileLoadError(null);
+      const response = await fetch(`${apiBaseUrl}/documents?type=loaded`);
       if (!response.ok) {
-        throw new Error('获取已处理文件列表失败');
+        throw new Error(`HTTP error! status: ${response.status}`);
       }
       const data = await response.json();
-      console.log('获取到的文件列表数据:', data);
-      
-      // 处理数据格式
-      const formattedFiles = (data.documents || [])
-        .filter(file => {
-          // 排除分块后的文件
-          const isChunked = file.name.includes('_chunked_') || 
-                          file.name.startsWith('chunked_') || 
-                          file.metadata?.chunking_method;
-          return !isChunked;
-        })
-        .map(file => {
-          return {
-            id: file.id,
-            filename: file.name,
-            file_type: file.metadata?.file_type || 'unknown',
-            loading_method: file.metadata?.loading_method || '未知',
-            timestamp: file.metadata?.timestamp,
-            key: file.id || Math.random().toString(36).substr(2, 9)
-          };
-        });
-      
-      console.log('格式化后的文件列表:', formattedFiles);
-      setParsedFiles(formattedFiles);
+      if (!Array.isArray(data)) {
+        throw new Error('服务器返回的数据格式不正确');
+      }
+      setParsedFiles(data);
     } catch (error) {
-      console.error('获取文件列表错误:', error);
-      message.error(error.message);
+      console.error('获取文件列表失败:', error);
+      setFileLoadError(error.message);
+      message.error(`加载失败：${error.message}`);
     } finally {
       setLoading(false);
     }
@@ -68,6 +55,7 @@ const FileProcessor = () => {
   // 初始加载文件列表
   useEffect(() => {
     fetchParsedFiles();
+    // 移除自动刷新，改为手动刷新
   }, []);
 
   // 当文件类型改变时更新加载工具和解析选项
@@ -95,18 +83,28 @@ const FileProcessor = () => {
           { value: 'unstructured', label: 'Unstructured' },
           { value: 'pdfplumber', label: 'PDF Plumber' }
         ];
+      case 'txt':
+        return [
+          { value: 'text', label: 'Text Parser' },
+          { value: 'line_by_line', label: 'Line by Line' }
+        ];
       case 'netlist':
         return [
           { value: 'verilog', label: 'Verilog Parser' },
-          { value: 'spice', label: 'SPICE Parser' }
+          { value: 'spice', label: 'SPICE Parser' },
+          { value: 'hspice', label: 'HSPICE Parser' }
         ];
       case 'lef':
         return [
-          { value: 'lef', label: 'LEF Parser' }
+          { value: 'lef', label: 'LEF Parser' },
+          { value: 'lef_tech', label: 'LEF Tech Parser' },
+          { value: 'lef_macro', label: 'LEF Macro Parser' }
         ];
       case 'lib':
         return [
-          { value: 'lib', label: 'LIB Parser' }
+          { value: 'lib', label: 'LIB Parser' },
+          { value: 'lib_timing', label: 'LIB Timing Parser' },
+          { value: 'lib_power', label: 'LIB Power Parser' }
         ];
       default:
         return [];
@@ -122,10 +120,16 @@ const FileProcessor = () => {
           { value: 'by_titles', label: '按标题' },
           { value: 'text_and_tables', label: '文本和表格' }
         ];
+      case 'txt':
+        return [
+          { value: 'all_text', label: '全部文本' },
+          { value: 'by_lines', label: '按行' },
+          { value: 'by_paragraphs', label: '按段落' }
+        ];
       case 'netlist':
         return [
           { value: 'all_text', label: '全部文本' },
-          { value: 'by_modules', label: '按模块' },
+          { value: 'by_module', label: '按模块' },
           { value: 'by_ports', label: '按端口' },
           { value: 'by_instances', label: '按实例' },
           { value: 'by_pins', label: '按引脚' },
@@ -135,21 +139,25 @@ const FileProcessor = () => {
         return [
           { value: 'all_text', label: '全部文本' },
           { value: 'by_layers', label: '按层' },
-          { value: 'by_macros', label: '按宏单元' }
+          { value: 'by_macros', label: '按宏单元' },
+          { value: 'by_sites', label: '按站点' },
+          { value: 'by_vias', label: '按通孔' }
         ];
       case 'lib':
         return [
           { value: 'all_text', label: '全部文本' },
           { value: 'by_cells', label: '按单元' },
-          { value: 'by_pins', label: '按引脚' }
+          { value: 'by_pins', label: '按引脚' },
+          { value: 'by_timing', label: '按时序' },
+          { value: 'by_power', label: '按功耗' }
         ];
       default:
         return [];
     }
   };
 
-  const handleFileSelect = (e) => {
-    const file = e.target.files[0];
+  const handleFileSelect = (info) => {
+    const file = info.file;
     if (file) {
       setFile(file);
       setCurrentStep(1);
@@ -159,6 +167,9 @@ const FileProcessor = () => {
       if (ext === 'pdf') {
         setFileType('pdf');
         setLoadingMethod('pymupdf');
+      } else if (ext === 'txt') {
+        setFileType('txt');
+        setLoadingMethod('text');
       } else if (['v', 'sp', 'spice'].includes(ext)) {
         setFileType('netlist');
         setLoadingMethod('verilog');
@@ -188,7 +199,7 @@ const FileProcessor = () => {
       formData.append('parsing_option', parsingOption);
       formData.append('file_type', fileType);
 
-      const response = await fetch(`${apiBaseUrl}/upload`, {
+      const response = await fetch(`${apiBaseUrl}/load`, {
         method: 'POST',
         body: formData
       });
@@ -229,49 +240,94 @@ const FileProcessor = () => {
   const handlePreview = async (file) => {
     try {
       setLoading(true);
-      // 只处理加载后的文件
-      const type = 'loaded';
-      const fileName = file.id.endsWith('.json') ? file.id : `${file.id}.json`;
+      const response = await fetch(`${apiBaseUrl}/documents/${file.filename}?type=loaded`);
       
-      const response = await fetch(`${apiBaseUrl}/documents/${fileName}?type=${type}`);
       if (!response.ok) {
         const errorText = await response.text();
-        throw new Error(`获取文件内容失败: ${response.status} - ${errorText}`);
+        let errorMessage;
+        try {
+          const errorData = JSON.parse(errorText);
+          errorMessage = errorData.detail || `获取文件内容失败: ${response.status}`;
+        } catch (e) {
+          errorMessage = `获取文件内容失败: ${response.status} - ${errorText}`;
+        }
+        throw new Error(errorMessage);
       }
+      
       const data = await response.json();
-      setPreviewFile(data);
+      console.log('获取到的文件内容:', data);
+      
+      // 处理不同的数据结构
+      let previewContent = [];
+      
+      if (data.content) {
+        // 如果是已解析的文档
+        if (Array.isArray(data.content)) {
+          previewContent = data.content.map((item, index) => ({
+            id: index + 1,
+            type: item.type || `内容块 ${index + 1}`,
+            content: item.content || item.text || JSON.stringify(item)
+          }));
+        } else if (typeof data.content === 'string') {
+          previewContent = [{
+            id: 1,
+            type: '文本内容',
+            content: data.content
+          }];
+        }
+      } else if (data.chunks) {
+        // 如果是分块后的文档
+        previewContent = data.chunks.map((chunk, index) => ({
+          id: index + 1,
+          type: `分块 ${index + 1}`,
+          content: chunk.content || chunk.text || JSON.stringify(chunk)
+        }));
+      } else if (data.text) {
+        // 如果是原始文本
+        previewContent = [{
+          id: 1,
+          type: '原始文本',
+          content: data.text
+        }];
+      } else {
+        // 如果都没有，尝试直接显示数据
+        previewContent = [{
+          id: 1,
+          type: '文档内容',
+          content: JSON.stringify(data, null, 2)
+        }];
+      }
+      
+      setPreviewFile({
+        ...file,
+        content: previewContent
+      });
       setPreviewVisible(true);
     } catch (error) {
-      console.error('预览文件失败:', error);
-      message.error(`预览文件失败: ${error.message}`);
+      console.error('预览文件错误:', error);
+      message.error(error.message);
     } finally {
       setLoading(false);
     }
   };
 
-  const handleDelete = (file) => {
-    Modal.confirm({
-      title: '确认删除',
-      content: `确定要删除文件 "${file.filename}" 吗？`,
-      okText: '确认',
-      okType: 'danger',
-      cancelText: '取消',
-      onOk: async () => {
-        try {
-          // 使用正确的API路径
-          const response = await fetch(`${apiBaseUrl}/files/loaded/${file.id}`, {
-            method: 'DELETE'
-          });
-          if (!response.ok) {
-            throw new Error('删除文件失败');
-          }
-          message.success('文件删除成功');
-          fetchParsedFiles();
-        } catch (error) {
-          message.error(error.message);
-        }
+  const handleDelete = async (file) => {
+    try {
+      const response = await fetch(`${apiBaseUrl}/documents/${file.id}?type=loaded`, {
+        method: 'DELETE'
+      });
+      
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.detail || '删除文件失败');
       }
-    });
+      
+      message.success('文件删除成功');
+      fetchParsedFiles(true); // 强制刷新列表
+    } catch (error) {
+      console.error('删除文件失败:', error);
+      message.error(`删除失败：${error.message}`);
+    }
   };
 
   // 表格列定义
@@ -312,10 +368,46 @@ const FileProcessor = () => {
       render: (method) => <Tag>{method || '未知'}</Tag>
     },
     {
+      title: '解析方法',
+      dataIndex: 'parsing_method',
+      key: 'parsing_method',
+      render: (method) => <Tag>{method || '未知'}</Tag>
+    },
+    {
+      title: '总页数',
+      dataIndex: 'total_pages',
+      key: 'total_pages',
+    },
+    {
+      title: '总块数',
+      dataIndex: 'total_chunks',
+      key: 'total_chunks',
+    },
+    {
       title: '处理时间',
       dataIndex: 'timestamp',
       key: 'timestamp',
-      render: (timestamp) => timestamp ? new Date(timestamp).toLocaleString() : '未知'
+      render: (text) => {
+        if (!text) return '-';
+        try {
+          const date = new Date(text);
+          if (!isNaN(date.getTime())) {
+            return date.toLocaleString('zh-CN', {
+              year: 'numeric',
+              month: '2-digit',
+              day: '2-digit',
+              hour: '2-digit',
+              minute: '2-digit',
+              second: '2-digit',
+              hour12: false
+            });
+          }
+          return '-';
+        } catch (e) {
+          console.warn('时间戳格式化失败:', e);
+          return '-';
+        }
+      }
     },
     {
       title: '操作',
@@ -386,13 +478,22 @@ const FileProcessor = () => {
 
             <div>
               <label className="block text-sm font-medium mb-1">上传文件</label>
-              <input
-                type="file"
-                accept=".pdf,.v,.sp,.spice,.lef,.lib"
+              <Upload.Dragger
+                name="file"
+                multiple={false}
+                action={`${apiBaseUrl}/upload`}
                 onChange={handleFileSelect}
-                className="block w-full border rounded px-3 py-2"
-                required
-              />
+                beforeUpload={() => false}
+                showUploadList={false}
+              >
+                <p className="ant-upload-drag-icon">
+                  <InboxOutlined />
+                </p>
+                <p className="ant-upload-text">点击或拖拽文件到此区域上传</p>
+                <p className="ant-upload-hint">
+                  支持单个文件上传，请选择要处理的文件
+                </p>
+              </Upload.Dragger>
             </div>
 
             {currentStep >= 1 && (
@@ -460,31 +561,49 @@ const FileProcessor = () => {
                 <h3 className="text-lg font-semibold">已处理文件</h3>
                 <Space>
                   <Input
+                    id="file-processor-search-input"
                     placeholder="搜索文件..."
                     prefix={<SearchOutlined />}
                     value={searchText}
                     onChange={e => setSearchText(e.target.value)}
                     style={{ width: 200 }}
                   />
-                  <Button
-                    icon={<ReloadOutlined />}
+                  <Button 
+                    icon={<ReloadOutlined />} 
                     onClick={fetchParsedFiles}
                     loading={loading}
                   />
                 </Space>
               </div>
             </div>
-            <Table
-              columns={columns}
-              dataSource={filteredFiles}
-              rowKey="key"
-              loading={loading}
-              pagination={{
-                defaultPageSize: 10,
-                showSizeChanger: true,
-                showTotal: (total) => `共 ${total} 个文件`
-              }}
-            />
+            
+            {fileLoadError ? (
+              <div className="p-4">
+                <Alert
+                  message="加载失败"
+                  description={fileLoadError}
+                  type="error"
+                  showIcon
+                  action={
+                    <Button size="small" onClick={fetchParsedFiles}>
+                      重试
+                    </Button>
+                  }
+                />
+              </div>
+            ) : (
+              <Table
+                dataSource={filteredFiles}
+                columns={columns}
+                loading={loading}
+                rowKey="key"
+                pagination={{
+                  defaultPageSize: 10,
+                  showSizeChanger: true,
+                  showTotal: (total) => `共 ${total} 个文件`
+                }}
+              />
+            )}
           </div>
         </div>
       </div>
@@ -497,32 +616,38 @@ const FileProcessor = () => {
         width={800}
         footer={null}
       >
-        {previewFile && (
+        {previewFile ? (
           <div className="max-h-[calc(100vh-200px)] overflow-y-auto">
             <div className="mb-4 p-3 border rounded bg-gray-100">
               <h4 className="font-medium mb-2">文档信息</h4>
               <div className="text-sm text-gray-600">
-                <p>文件名: {previewFile.metadata?.filename || previewFile.filename}</p>
-                <p>处理方法: {previewFile.metadata?.parsing_method || previewFile.parsing_method}</p>
-                <p>时间戳: {(previewFile.metadata?.timestamp || previewFile.timestamp) && 
-                  new Date(previewFile.metadata?.timestamp || previewFile.timestamp).toLocaleString()}</p>
+                <p>文件名: {previewFile.filename}</p>
+                <p>文件类型: {previewFile.file_type || '未知'}</p>
+                <p>处理方法: {previewFile.loading_method || '未知'}</p>
+                <p>处理时间: {previewFile.timestamp && new Date(previewFile.timestamp).toLocaleString()}</p>
               </div>
             </div>
             <div className="space-y-3">
               {Array.isArray(previewFile.content) ? (
-                previewFile.content.map((item, idx) => (
-                  <div key={idx} className="p-4 border rounded-lg bg-white shadow-sm">
+                previewFile.content.map((item) => (
+                  <div key={item.id} className="p-4 border rounded-lg bg-white shadow-sm">
                     <h3 className="text-lg font-semibold mb-2">{item.type}</h3>
-                    <p className="text-sm text-gray-500">{item.content}</p>
+                    <pre className="whitespace-pre-wrap text-sm bg-gray-50 p-3 rounded">
+                      {item.content}
+                    </pre>
                   </div>
                 ))
               ) : (
                 <div className="p-4 border rounded-lg bg-white shadow-sm">
-                  <pre className="whitespace-pre-wrap text-sm">{JSON.stringify(previewFile, null, 2)}</pre>
+                  <pre className="whitespace-pre-wrap text-sm bg-gray-50 p-3 rounded">
+                    {JSON.stringify(previewFile.content, null, 2)}
+                  </pre>
                 </div>
               )}
             </div>
           </div>
+        ) : (
+          <Spin tip="加载中..." />
         )}
       </Modal>
     </div>

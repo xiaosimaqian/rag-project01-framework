@@ -6,6 +6,7 @@ import logging
 import os
 from datetime import datetime
 import json
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 """
@@ -55,7 +56,7 @@ class LoadingService:
             if file_ext == '.pdf':
                 return self.load_pdf(file_path, loading_method, **kwargs)
             elif file_ext in ['.v', '.sp', '.spice']:
-                return self.load_netlist(file_path)
+                return self.load_netlist(file_path, loading_method)
             elif file_ext == '.lef':
                 return self.load_lef(file_path)
             elif file_ext == '.lib':
@@ -301,7 +302,7 @@ class LoadingService:
         保存处理后的文档数据。
 
         参数:
-            filename (str): 原PDF文件名
+            filename (str): 原文件名
             chunks (list): 文档分块列表
             metadata (dict): 文档元数据
             loading_method (str): 使用的加载方法
@@ -312,43 +313,48 @@ class LoadingService:
             str: 保存的文件路径
         """
         try:
-            timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
-            # 只使用原始文件名（不含扩展名）和时间戳
-            base_name = os.path.splitext(filename)[0]
-            doc_name = f"{base_name}_{timestamp}"
-            
-            # 构建文档数据结构，确保所有值都是可序列化的
+            # 构建文档数据结构
             document_data = {
-                "filename": str(filename),
-                "total_chunks": int(len(chunks)),
-                "total_pages": int(metadata.get("total_pages", 1)),
-                "loading_method": str(loading_method),
-                "loading_strategy": str(strategy) if loading_method == "unstructured" and strategy else None,
-                "chunking_strategy": str(chunking_strategy) if loading_method == "unstructured" and chunking_strategy else None,
-                "chunking_method": "loaded",
-                "timestamp": datetime.now().isoformat(),
-                "chunks": chunks
+                "metadata": {
+                    "filename": str(filename),
+                    "file_type": os.path.splitext(filename)[1].lower()[1:],
+                    "loading_method": str(loading_method),
+                    "parsing_method": str(loading_method),
+                    "strategy": str(strategy) if strategy else None,
+                    "chunking_strategy": str(chunking_strategy) if chunking_strategy else None,
+                    "timestamp": datetime.now().isoformat(),
+                    "total_pages": int(metadata.get("total_pages", 1)),
+                    "total_chunks": int(len(chunks))
+                },
+                "content": chunks
             }
             
-            # 保存到文件
-            filepath = os.path.join("01-loaded-docs", f"{doc_name}.json")
-            os.makedirs("01-loaded-docs", exist_ok=True)
+            # 使用与 main.py 一致的路径处理方式
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            parsed_files_dir = os.path.join(base_dir, "01-loaded-docs")
+            os.makedirs(parsed_files_dir, exist_ok=True)
+            
+            # 使用原始文件名（不含扩展名）作为保存文件名
+            base_name = os.path.splitext(filename)[0]
+            filepath = os.path.join(parsed_files_dir, f"{base_name}.json")
             
             with open(filepath, 'w', encoding='utf-8') as f:
                 json.dump(document_data, f, ensure_ascii=False, indent=2)
                 
+            logger.info(f"文档已保存到: {filepath}")
             return filepath
             
         except Exception as e:
-            logger.error(f"Error saving document: {str(e)}")
+            logger.error(f"保存文档时出错: {str(e)}")
             raise
 
-    def load_netlist(self, file_path: str) -> str:
+    def load_netlist(self, file_path: str, loading_method: str = "verilog") -> str:
         """
         加载 Netlist 文件
         
         参数:
             file_path: 文件路径
+            loading_method: 加载方法，支持 "verilog" 或 "spice"
             
         返回:
             Netlist 内容
@@ -357,38 +363,75 @@ class LoadingService:
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
                 
-            # 将 Netlist 内容按模块分块
-            modules = []
-            current_module = []
-            
-            for line in content.split('\n'):
-                line = line.strip()
-                if not line or line.startswith('*'):  # 跳过空行和注释
-                    continue
-                    
-                if line.startswith('.SUBCKT') or line.startswith('.module'):
-                    if current_module:
-                        modules.append('\n'.join(current_module))
-                    current_module = [line]
-                else:
-                    current_module.append(line)
-                    
-            if current_module:
-                modules.append('\n'.join(current_module))
+            # 根据不同的加载方法处理内容
+            if loading_method == "verilog":
+                # Verilog 文件处理
+                modules = []
+                current_module = []
                 
-            # 创建页面映射
-            self.current_page_map = [
-                {
-                    'page': i + 1,
-                    'text': module,
-                    'metadata': {
-                        'type': 'module',
-                        'name': module.split()[1] if len(module.split()) > 1 else f'Module_{i+1}'
+                for line in content.split('\n'):
+                    line = line.strip()
+                    if not line or line.startswith('//'):  # 跳过空行和注释
+                        continue
+                        
+                    if line.startswith('module'):
+                        if current_module:
+                            modules.append('\n'.join(current_module))
+                        current_module = [line]
+                    else:
+                        current_module.append(line)
+                        
+                if current_module:
+                    modules.append('\n'.join(current_module))
+                    
+                # 创建页面映射
+                self.current_page_map = [
+                    {
+                        'page': i + 1,
+                        'text': module,
+                        'metadata': {
+                            'type': 'module',
+                            'name': module.split()[1] if len(module.split()) > 1 else f'Module_{i+1}'
+                        }
                     }
-                }
-                for i, module in enumerate(modules)
-            ]
-            
+                    for i, module in enumerate(modules)
+                ]
+                
+            elif loading_method == "spice":
+                # SPICE 文件处理
+                subcircuits = []
+                current_subcircuit = []
+                
+                for line in content.split('\n'):
+                    line = line.strip()
+                    if not line or line.startswith('*'):  # 跳过空行和注释
+                        continue
+                        
+                    if line.startswith('.SUBCKT'):
+                        if current_subcircuit:
+                            subcircuits.append('\n'.join(current_subcircuit))
+                        current_subcircuit = [line]
+                    else:
+                        current_subcircuit.append(line)
+                        
+                if current_subcircuit:
+                    subcircuits.append('\n'.join(current_subcircuit))
+                    
+                # 创建页面映射
+                self.current_page_map = [
+                    {
+                        'page': i + 1,
+                        'text': subcircuit,
+                        'metadata': {
+                            'type': 'subcircuit',
+                            'name': subcircuit.split()[1] if len(subcircuit.split()) > 1 else f'Subcircuit_{i+1}'
+                        }
+                    }
+                    for i, subcircuit in enumerate(subcircuits)
+                ]
+            else:
+                raise ValueError(f"Unsupported netlist loading method: {loading_method}")
+                
             self.total_pages = len(self.current_page_map)
             return content
             

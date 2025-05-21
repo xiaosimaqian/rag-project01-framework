@@ -2,19 +2,24 @@
 import React, { useState, useEffect } from 'react';
 import RandomImage from '../components/RandomImage';
 import { apiBaseUrl } from '../config/config';
+import { Button, Input, Space, Table, Tag, message, Select, InputNumber } from 'antd';
+import { SearchOutlined, ReloadOutlined } from '@ant-design/icons';
 
 const Search = () => {
   const [query, setQuery] = useState('');
   const [collection, setCollection] = useState('');
   const [results, setResults] = useState([]);
   const [isSearching, setIsSearching] = useState(false);
-  const [topK, setTopK] = useState(3);
+  const [topK, setTopK] = useState(5);
   const [threshold, setThreshold] = useState(0.7);
   const [collections, setCollections] = useState([]);
   const [selectedProvider, setSelectedProvider] = useState('milvus');
   const [wordCountThreshold, setWordCountThreshold] = useState(100);
   const [saveResults, setSaveResults] = useState(false);
   const [status, setStatus] = useState('');
+  const [searchText, setSearchText] = useState('');
+  const [searchResults, setSearchResults] = useState([]);
+  const [loading, setLoading] = useState(false);
 
   // 定义支持的向量数据库
   const providers = [
@@ -23,74 +28,70 @@ const Search = () => {
   ];
 
   // 加载collections
-  useEffect(() => {
-    const fetchCollections = async () => {
-      try {
-        setStatus('正在加载集合列表...');
-        const response = await fetch(`${apiBaseUrl}/collections?provider=${selectedProvider}`);
-        if (!response.ok) {
-          throw new Error(`HTTP error! status: ${response.status}`);
-        }
-        const data = await response.json();
-        setCollections(data.collections || []);
-        setStatus('');
-      } catch (error) {
-        console.error('Error fetching collections:', error);
-        setStatus(`加载集合列表失败: ${error.message}`);
-        setCollections([]);
+  const fetchCollections = async () => {
+    try {
+      setStatus('正在加载集合列表...');
+      const response = await fetch(`${apiBaseUrl}/collections?provider=${selectedProvider}`);
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
       }
-    };
+      const data = await response.json();
+      setCollections(data.collections || []);
+      setStatus('');
+    } catch (error) {
+      console.error('Error fetching collections:', error);
+      setStatus(`加载集合列表失败: ${error.message}`);
+      setCollections([]);
+    }
+  };
 
+  useEffect(() => {
     fetchCollections();
   }, [selectedProvider]);
 
   const handleSearch = async () => {
-    if (!query || !collection) {
-      setStatus('请选择集合并输入搜索内容');
+    if (!searchText.trim()) {
+      message.warning('请输入搜索内容');
       return;
     }
 
-    setIsSearching(true);
-    setStatus('正在搜索...');
-    try {
-      const searchParams = {
-        query: query,
-        collection_name: collection,
-        provider: selectedProvider,
-        top_k: topK,
-        threshold: threshold
-      };
-      
-      console.log('发送搜索请求:', searchParams);
+    if (!collection) {
+      message.warning('请选择要搜索的集合');
+      return;
+    }
 
+    setLoading(true);
+    try {
       const response = await fetch(`${apiBaseUrl}/search`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify(searchParams),
+        body: JSON.stringify({
+          query: searchText,
+          collection_name: collection,
+          top_k: topK,
+          threshold: threshold,
+        }),
       });
 
       if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+        throw new Error('搜索失败');
       }
 
       const data = await response.json();
-      console.log('搜索响应:', data);
-
-      if (data.details && data.details.hits && data.details.hits.length > 0) {
-        setResults(data.details.hits);
-        setStatus('搜索完成！');
+      console.log('搜索响应内容:', data);
+      if (data.status === 'success' && Array.isArray(data.results)) {
+        setSearchResults(data.results);
+        setResults(data.results);
+        message.success(data.message);
       } else {
-        setResults([]);
-        setStatus('未找到匹配的结果');
+        throw new Error('搜索结果格式错误');
       }
     } catch (error) {
-      console.error('搜索错误:', error);
-      setStatus(`搜索出错: ${error.message}`);
-      setResults([]);
+      message.error(error.message);
     } finally {
-      setIsSearching(false);
+      setLoading(false);
     }
   };
 
@@ -102,7 +103,7 @@ const Search = () => {
 
     try {
       const saveParams = {
-        query,
+        query: searchText,
         collection_id: collection,
         results: results
       };
@@ -123,171 +124,175 @@ const Search = () => {
 
       const data = await response.json();
       setStatus(`结果已保存至: ${data.saved_filepath}`);
+      message.success('搜索结果保存成功');
     } catch (error) {
       console.error('保存错误:', error);
       setStatus(`保存失败: ${error.message}`);
+      message.error('保存失败: ' + error.message);
     }
   };
 
+  // 聚合所有模块名
+  const moduleNames = Array.from(new Set(results
+    .map(item => item.source?.module_name)
+    .filter(Boolean)
+  ));
+
+  // 只显示模块声明chunk的筛选
+  const [showModuleDeclOnly, setShowModuleDeclOnly] = useState(false);
+  const filteredResults = showModuleDeclOnly
+    ? results.filter(item => item.source?.is_module_decl)
+    : results;
+
+  // 表格列定义
+  const columns = [
+    {
+      title: '文件名',
+      dataIndex: 'file_name',
+      key: 'file_name',
+      render: (_, record) => record.source?.file_name || record.source?.document_name || '未知',
+    },
+    {
+      title: '页码',
+      dataIndex: 'page_number',
+      key: 'page_number',
+      render: (_, record) => record.source?.page_number ?? '未知',
+    },
+    {
+      title: '块号',
+      dataIndex: 'chunk_id',
+      key: 'chunk_id',
+      render: (_, record) => record.source?.chunk_id ?? '未知',
+    },
+    {
+      title: '相似度',
+      dataIndex: 'score',
+      key: 'score',
+      render: (score) => (score ? (score * 100).toFixed(2) + '%' : '0.00%'),
+    },
+    {
+      title: '内容',
+      dataIndex: 'content',
+      key: 'content',
+    },
+    {
+      title: '来源',
+      key: 'source',
+      render: (_, record) => (
+        <>
+          文件名: {record.source?.file_name || record.source?.document_name || '未知'}<br />
+          页码: {record.source?.page_number ?? '未知'}<br />
+          块号: {record.source?.chunk_id ?? '未知'}
+        </>
+      ),
+    },
+  ];
+
   return (
     <div className="p-6">
-      <h2 className="text-2xl font-bold mb-6">相似度搜索</h2>
-      
-      <div className="grid grid-cols-12 gap-6">
-        {/* Left Panel - Search Controls */}
-        <div className="col-span-3 space-y-4">
-          <div className="p-4 border rounded-lg bg-white shadow-sm">
-            <div className="space-y-4">
-              <div>
-                <label className="block text-sm font-medium mb-1">搜索问题</label>
-                <textarea
-                  value={query}
-                  onChange={(e) => setQuery(e.target.value)}
-                  placeholder="请输入您的搜索问题..."
-                  className="block w-full p-2 border rounded h-32 resize-none"
-                />
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium mb-1">向量数据库</label>
-                <select
-                  value={selectedProvider}
-                  onChange={(e) => setSelectedProvider(e.target.value)}
-                  className="block w-full p-2 border rounded"
-                >
-                  {providers.map(provider => (
-                    <option key={provider.id} value={provider.id}>
-                      {provider.name}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium mb-1">集合</label>
-                <select
-                  value={collection}
-                  onChange={(e) => setCollection(e.target.value)}
-                  className="block w-full p-2 border rounded"
-                >
-                  <option value="">选择集合...</option>
-                  {collections.map(coll => (
-                    <option key={coll.id} value={coll.id}>
-                      {coll.name} ({coll.count} 个向量)
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium mb-1">返回结果数量</label>
-                <input
-                  type="number"
-                  value={topK}
-                  onChange={(e) => setTopK(parseInt(e.target.value))}
-                  min="1"
-                  max="10"
-                  className="block w-full p-2 border rounded"
-                />
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium mb-1">
-                  相似度阈值: {threshold}
-                </label>
-                <input
-                  type="range"
-                  value={threshold}
-                  onChange={(e) => setThreshold(parseFloat(e.target.value))}
-                  min="0"
-                  max="1"
-                  step="0.1"
-                  className="block w-full"
-                />
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium mb-1">
-                  最小词数: {wordCountThreshold}
-                </label>
-                <input
-                  type="range"
-                  value={wordCountThreshold}
-                  onChange={(e) => setWordCountThreshold(parseInt(e.target.value))}
-                  min="0"
-                  max="500"
-                  step="10"
-                  className="block w-full"
-                />
-              </div>
-
-              <div className="mt-4">
-                <label className="flex items-center space-x-2 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={saveResults}
-                    onChange={(e) => setSaveResults(e.target.checked)}
-                    className="form-checkbox h-4 w-4 text-blue-600"
-                  />
-                  <span className="text-sm font-medium">保存搜索结果</span>
-                </label>
-              </div>
-
-              <button 
-                onClick={handleSearch}
-                disabled={isSearching}
-                className="w-full px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 disabled:bg-blue-300"
-              >
-                {isSearching ? '搜索中...' : '开始搜索'}
-              </button>
-            </div>
-          </div>
-
-          {status && (
-            <div className={`p-4 rounded-lg ${
-              status.includes('错误') || status.includes('失败') 
-                ? 'bg-red-100 text-red-700' 
-                : 'bg-green-100 text-green-700'
-            }`}>
-              {status}
-            </div>
-          )}
+      <h2 className="text-2xl font-bold mb-6">语义搜索</h2>
+      <div className="mb-4">
+        <b>本次检索涉及模块：</b>
+        {moduleNames.length > 0 ? moduleNames.join('，') : '无'}
+        <Button
+          style={{ marginLeft: 16 }}
+          onClick={() => setShowModuleDeclOnly(v => !v)}
+        >
+          {showModuleDeclOnly ? '显示全部结果' : '只看模块声明'}
+        </Button>
+        <Button
+          type="primary"
+          style={{ marginLeft: 16 }}
+          onClick={handleSaveResults}
+          disabled={!results.length}
+        >
+          保存搜索结果
+        </Button>
+      </div>
+      <div className="space-y-6">
+        {/* 集合选择 */}
+        <div className="flex space-x-4">
+          <Select
+            placeholder="选择要搜索的集合"
+            value={collection}
+            onChange={setCollection}
+            style={{ width: 300 }}
+            loading={loading}
+          >
+            {collections.map((col) => (
+              <Select.Option key={col.id} value={col.id}>
+                {col.name} ({col.count} 条记录)
+              </Select.Option>
+            ))}
+          </Select>
+          <Button
+            icon={<ReloadOutlined />}
+            onClick={() => fetchCollections()}
+            loading={loading}
+          >
+            刷新集合列表
+          </Button>
         </div>
 
-        {/* Right Panel - Results */}
-        <div className="col-span-9 border rounded-lg bg-white shadow-sm">
-          {results.length > 0 ? (
-            <div className="p-4">
-              <div className="flex justify-between items-center mb-4">
-                <h3 className="text-xl font-semibold">搜索结果</h3>
-                <button
-                  onClick={handleSaveResults}
-                  className="px-4 py-2 bg-green-500 text-white rounded hover:bg-green-600"
-                >
-                  保存搜索结果
-                </button>
-              </div>
-              <div className="space-y-4 max-h-[calc(100vh-200px)] overflow-y-auto">
-                {results.map((result, idx) => (
-                  <div key={idx} className="p-4 border rounded bg-gray-50">
-                    <div className="flex justify-between items-start mb-2">
-                      <span className="font-medium text-sm text-gray-500">
-                        相似度: {(result.score * 100).toFixed(1)}%
-                      </span>
-                      <div className="text-sm text-gray-500">
-                        <div>文档: {result.metadata?.document_name || 'N/A'}</div>
-                        <div>页码: {result.metadata?.page_number || 'N/A'}</div>
-                        <div>块号: {result.metadata?.chunk_id || 'N/A'}</div>
-                      </div>
-                    </div>
-                    <p className="text-sm whitespace-pre-wrap">{result.content || result.text}</p>
-                  </div>
-                ))}
-              </div>
-            </div>
-          ) : (
-            <RandomImage message="搜索结果将在这里显示" />
-          )}
+        {/* 搜索框 */}
+        <div className="flex space-x-4">
+          <Input
+            id="search-page-search-input"
+            placeholder="输入搜索内容..."
+            value={searchText}
+            onChange={(e) => setSearchText(e.target.value)}
+            onPressEnter={handleSearch}
+            size="large"
+            className="flex-1"
+          />
+          <InputNumber
+            min={1}
+            max={16384}  // 修改为 Milvus 支持的最大值
+            defaultValue={5}
+            value={topK}
+            onChange={setTopK}
+            style={{ width: 100 }}
+            size="large"
+          />
+          <InputNumber
+            min={0}
+            max={1}
+            step={0.1}
+            defaultValue={0.7}
+            value={threshold}
+            onChange={setThreshold}
+            style={{ width: 100 }}
+            size="large"
+            placeholder="相似度阈值"
+          />
+          <Button
+            type="primary"
+            icon={<SearchOutlined />}
+            onClick={handleSearch}
+            loading={loading}
+            size="large"
+          >
+            搜索
+          </Button>
+        </div>
+
+        {/* 搜索结果 */}
+        <div className="border rounded-lg bg-white shadow-sm">
+          <div className="p-4 border-b">
+            <h3 className="text-lg font-semibold">搜索结果</h3>
+          </div>
+          <Table
+            columns={columns}
+            dataSource={filteredResults}
+            rowKey={(record) => record.id || record.source?.chunk_id || Math.random().toString(36).substr(2, 9)}
+            loading={loading}
+            pagination={{
+              pageSize: 10,
+              showSizeChanger: true,
+              pageSizeOptions: [5, 10, 20, 50, 100],
+              showTotal: (total) => `共 ${total} 条结果`,
+            }}
+          />
         </div>
       </div>
     </div>

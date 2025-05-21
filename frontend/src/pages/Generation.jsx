@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { useLocation } from 'react-router-dom';
 import RandomImage from '../components/RandomImage';
 import { apiBaseUrl } from '../config/config';
@@ -86,30 +86,58 @@ const Generation = () => {
   const [showRequestCommand, setShowRequestCommand] = useState(false);
   const [selectedContextFiles, setSelectedContextFiles] = useState([]);
   const [contextContents, setContextContents] = useState([]);
+  const [fileList, setFileList] = useState([]);
+  const [showFileManager, setShowFileManager] = useState(false);
+  const [chunkedFiles, setChunkedFiles] = useState([]);
+  const [selectedChunkedFiles, setSelectedChunkedFiles] = useState([]);
+  const [showChunkedFileManager, setShowChunkedFileManager] = useState(false);
+  const [additionalContext, setAdditionalContext] = useState('');
   
-  // 修改状态初始化
+  // 添加新的状态变量
+  const [isLoadingFiles, setIsLoadingFiles] = useState(false);
+  const [isLoadingChunkedFiles, setIsLoadingChunkedFiles] = useState(false);
+  const [fileLoadError, setFileLoadError] = useState(null);
+  const [chunkedFileLoadError, setChunkedFileLoadError] = useState(null);
+  const [lastFileUpdate, setLastFileUpdate] = useState(null);
+  const [lastChunkedFileUpdate, setLastChunkedFileUpdate] = useState(null);
+
+  // 使用 useMemo 优化分块文件列表
+  const uniqueChunkedFiles = useMemo(() => {
+    return chunkedFiles.reduce((acc, file) => {
+      if (acc.some(f => f.id === file.id)) {
+        return acc;
+      }
+      return [...acc, file];
+    }, []).sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+  }, [chunkedFiles]);
+
+  // 添加本地存储相关状态
   const [uploadedFiles, setUploadedFiles] = useState(() => {
-    // 只从 localStorage 恢复小文件的状态信息
-    const savedFiles = storage.getItem('uploadedFiles');
-    if (savedFiles) {
-      return savedFiles.filter(file => file.size < 2 * 1024 * 1024); // 只恢复小于2MB的文件
+    try {
+      // 只从 localStorage 恢复小文件的状态信息
+      const savedFiles = storage.getItem('uploadedFiles');
+      if (savedFiles) {
+        return savedFiles.filter(file => file.size < 2 * 1024 * 1024); // 只恢复小于2MB的文件
+      }
+    } catch (error) {
+      console.error('Error loading files from storage:', error);
     }
     return [];
   });
 
-  const [additionalContext, setAdditionalContext] = useState(() => {
-    // 只从 localStorage 恢复小文件的内容
-    const savedContext = storage.getItem('additionalContext');
-    return savedContext || '';
-  });
+  // 添加缓存时间常量
+  const CACHE_DURATION = 5 * 60 * 1000; // 5分钟缓存
 
-  // 添加文件列表状态
-  const [fileList, setFileList] = useState([]);
-  const [showFileManager, setShowFileManager] = useState(false);
+  // 修改文件列表获取函数
+  const fetchFileList = async (force = false) => {
+    // 如果数据已缓存且未过期，直接返回
+    if (!force && lastFileUpdate && (Date.now() - lastFileUpdate) < CACHE_DURATION && fileList.length > 0) {
+      return;
+    }
 
-  // 添加获取文件列表的函数
-  const fetchFileList = async () => {
     try {
+      setIsLoadingFiles(true);
+      setFileLoadError(null);
       console.log('获取文件列表...');
       const response = await fetch(`${apiBaseUrl}/files`);
       if (!response.ok) {
@@ -118,9 +146,16 @@ const Generation = () => {
       const data = await response.json();
       console.log('文件列表:', data);
       setFileList(data.files || []);
+      setLastFileUpdate(Date.now());
     } catch (error) {
       console.error('获取文件列表错误:', error);
-      setStatus(`获取文件列表失败: ${error.message}`);
+      setFileLoadError(error.message);
+      // 如果是网络错误，3秒后自动重试
+      if (error.name === 'TypeError') {
+        setTimeout(() => fetchFileList(true), 3000);
+      }
+    } finally {
+      setIsLoadingFiles(false);
     }
   };
 
@@ -348,109 +383,419 @@ const Generation = () => {
     }
   };
 
+  // 修改分块文件列表获取函数
+  const fetchChunkedFiles = async (force = false) => {
+    // 如果数据已缓存且未过期，直接返回
+    if (!force && lastChunkedFileUpdate && (Date.now() - lastChunkedFileUpdate) < CACHE_DURATION && chunkedFiles.length > 0) {
+      return;
+    }
+
+    try {
+      setIsLoadingChunkedFiles(true);
+      setChunkedFileLoadError(null);
+      console.log('获取分块文件列表...');
+      const response = await fetch(`${apiBaseUrl}/chunked-files`);
+      if (!response.ok) {
+        throw new Error('获取分块文件列表失败');
+      }
+      const data = await response.json();
+      console.log('分块文件列表:', data);
+      setChunkedFiles(data.files || []);
+      setLastChunkedFileUpdate(Date.now());
+    } catch (error) {
+      console.error('获取分块文件列表错误:', error);
+      setChunkedFileLoadError(error.message);
+      // 如果是网络错误，3秒后自动重试
+      if (error.name === 'TypeError') {
+        setTimeout(() => fetchChunkedFiles(true), 3000);
+      }
+    } finally {
+      setIsLoadingChunkedFiles(false);
+    }
+  };
+  
+  // 在组件加载时获取分块文件列表
+  useEffect(() => {
+    fetchChunkedFiles();
+  }, []);
+  
+  // 优化分块文件选择处理函数
+  const handleChunkedFileSelection = async (fileId) => {
+    try {
+      // 检查是否已经选择
+      if (selectedChunkedFiles.includes(fileId)) {
+        return;
+      }
+      
+      // 立即更新UI状态，提供即时反馈
+      setSelectedChunkedFiles(prev => [...prev, fileId]);
+      
+      // 异步获取文件内容
+      const response = await fetch(`${apiBaseUrl}/chunked-files/${fileId}`);
+      if (!response.ok) {
+        // 如果获取失败，回滚选择状态
+        setSelectedChunkedFiles(prev => prev.filter(id => id !== fileId));
+        throw new Error('获取分块文件内容失败');
+      }
+      
+      const data = await response.json();
+      setStatus(`已选择分块文件: ${data.document_name}`);
+    } catch (error) {
+      console.error('选择分块文件错误:', error);
+      setStatus(`选择分块文件失败: ${error.message}`);
+    }
+  };
+
+  // 优化分块文件取消选择处理函数
+  const handleChunkedFileDeselection = (fileId) => {
+    setSelectedChunkedFiles(prev => prev.filter(id => id !== fileId));
+  };
+
+  // 修改组件加载时的文件获取逻辑
+  useEffect(() => {
+    // 只在显示文件管理器时获取数据
+    if (showFileManager) {
+      fetchFileList();
+    }
+    if (showChunkedFileManager) {
+      fetchChunkedFiles();
+    }
+  }, [showFileManager, showChunkedFileManager]);
+
+  // 添加手动刷新按钮的处理函数
+  const handleRefreshFiles = () => {
+    fetchFileList(true);
+  };
+
+  const handleRefreshChunkedFiles = () => {
+    fetchChunkedFiles(true);
+  };
+
+  // 修改文件管理器渲染函数
+  const renderFileManager = () => {
+    if (!showFileManager) return null;
+
+    return (
+      <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+        <div className="bg-white rounded-lg p-6 w-3/4 max-h-[80vh] overflow-y-auto">
+          <div className="flex justify-between items-center mb-4">
+            <h3 className="text-lg font-semibold">选择文件</h3>
+            <div className="flex space-x-2">
+              <button
+                onClick={handleRefreshFiles}
+                className="text-sm bg-blue-100 px-3 py-1 rounded hover:bg-blue-200"
+              >
+                刷新
+              </button>
+              <button
+                onClick={() => setShowFileManager(false)}
+                className="text-gray-500 hover:text-gray-700"
+              >
+                ✕
+              </button>
+            </div>
+          </div>
+          
+          {/* 加载状态和错误提示 */}
+          {isLoadingFiles && (
+            <div className="flex items-center justify-center py-4">
+              <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-blue-500"></div>
+              <span className="ml-2 text-gray-600">加载文件列表中...</span>
+            </div>
+          )}
+          
+          {fileLoadError && (
+            <div className="bg-red-50 text-red-600 p-3 rounded mb-4 flex items-center justify-between">
+              <span>{fileLoadError}</span>
+              <button
+                onClick={() => fetchFileList(true)}
+                className="text-sm bg-red-100 px-3 py-1 rounded hover:bg-red-200"
+              >
+                重试
+              </button>
+            </div>
+          )}
+          
+          {/* 文件列表 */}
+          <div className="space-y-2">
+            {fileList.map((file) => (
+              <div
+                key={file.id}
+                className="flex items-center justify-between p-2 hover:bg-gray-50 rounded"
+              >
+                <div className="flex items-center space-x-2">
+                  <input
+                    type="checkbox"
+                    checked={selectedContextFiles.includes(file.id)}
+                    onChange={(e) => {
+                      if (e.target.checked) {
+                        handleFileSelection(file.id);
+                      } else {
+                        handleFileDeselection(file.id);
+                      }
+                    }}
+                    className="form-checkbox h-4 w-4 text-blue-600"
+                  />
+                  <span className="text-sm">{file.filename}</span>
+                </div>
+                <div className="text-xs text-gray-500">
+                  {new Date(file.upload_time).toLocaleString()}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  // 修改分块文件管理器渲染函数
+  const renderChunkedFileManager = () => {
+    if (!showChunkedFileManager) return null;
+
+    return (
+      <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+        <div className="bg-white rounded-lg p-6 w-3/4 max-h-[80vh] overflow-y-auto">
+          <div className="flex justify-between items-center mb-4">
+            <h3 className="text-lg font-semibold">选择分块文件</h3>
+            <div className="flex space-x-2">
+              <button
+                onClick={handleRefreshChunkedFiles}
+                className="text-sm bg-blue-100 px-3 py-1 rounded hover:bg-blue-200"
+              >
+                刷新
+              </button>
+              <button
+                onClick={() => setShowChunkedFileManager(false)}
+                className="text-gray-500 hover:text-gray-700"
+              >
+                ✕
+              </button>
+            </div>
+          </div>
+
+          {/* 加载状态和错误提示 */}
+          {isLoadingChunkedFiles && (
+            <div className="flex items-center justify-center py-4">
+              <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-green-500"></div>
+              <span className="ml-2 text-gray-600">加载分块文件列表中...</span>
+            </div>
+          )}
+          
+          {chunkedFileLoadError && (
+            <div className="bg-red-50 text-red-600 p-3 rounded mb-4 flex items-center justify-between">
+              <span>{chunkedFileLoadError}</span>
+              <button
+                onClick={() => fetchChunkedFiles(true)}
+                className="text-sm bg-red-100 px-3 py-1 rounded hover:bg-red-200"
+              >
+                重试
+              </button>
+            </div>
+          )}
+          
+          {/* 分块文件列表 */}
+          <div className="space-y-2">
+            {uniqueChunkedFiles.map((file) => (
+              <div
+                key={file.id}
+                className="flex items-center justify-between p-2 hover:bg-gray-50 rounded"
+              >
+                <div className="flex items-center space-x-2">
+                  <input
+                    type="checkbox"
+                    checked={selectedChunkedFiles.includes(file.id)}
+                    onChange={(e) => {
+                      if (e.target.checked) {
+                        handleChunkedFileSelection(file.id);
+                      } else {
+                        handleChunkedFileDeselection(file.id);
+                      }
+                    }}
+                    className="form-checkbox h-4 w-4 text-green-600"
+                  />
+                  <div>
+                    <span className="text-sm">{file.name}</span>
+                    <div className="text-xs text-gray-500">
+                      {file.total_chunks} 块 • {file.total_pages} 页 • {file.chunking_method}
+                    </div>
+                  </div>
+                </div>
+                <div className="text-xs text-gray-500">
+                  {new Date(file.timestamp).toLocaleString()}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  // 添加文件选择区域渲染函数
+  const renderFileSelection = () => {
+    return (
+      <div className="mb-4">
+        <div className="flex items-center justify-between mb-2">
+          <label className="block text-sm font-medium text-gray-700">补充文件</label>
+          <div className="flex space-x-2">
+            <label className="px-3 py-1 text-sm bg-blue-500 text-white rounded hover:bg-blue-600 cursor-pointer">
+              添加新文件
+              <input
+                type="file"
+                multiple
+                onChange={handleFileUpload}
+                className="hidden"
+                accept={Object.values(SUPPORTED_FILE_TYPES).flat().join(',')}
+              />
+            </label>
+            <button
+              onClick={() => setShowChunkedFileManager(true)}
+              className="px-3 py-1 text-sm bg-green-500 text-white rounded hover:bg-green-600"
+            >
+              添加分块文件
+            </button>
+          </div>
+        </div>
+        
+        {/* 显示已选择的文件 */}
+        {(selectedContextFiles.length > 0 || selectedChunkedFiles.length > 0) && (
+          <div className="mt-2 space-y-2 max-h-[300px] overflow-y-auto">
+            {/* 显示已选择的新文件 */}
+            {selectedContextFiles.map((fileId) => {
+              const file = fileList.find(f => f.id === fileId);
+              return file ? (
+                <div key={fileId} className="flex items-center justify-between p-2 bg-gray-50 rounded hover:bg-gray-100 transition-colors duration-200">
+                  <div className="flex items-center space-x-2 min-w-0 flex-1">
+                    <div className="truncate">
+                      <span className="text-sm font-medium text-gray-900 truncate">{file.filename}</span>
+                      <span className="text-xs text-gray-500 ml-2">(新文件)</span>
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => handleFileDeselection(fileId)}
+                    className="ml-4 flex-shrink-0 text-red-500 hover:text-red-700"
+                  >
+                    移除
+                  </button>
+                </div>
+              ) : null;
+            })}
+            
+            {/* 显示已选择的分块文件 */}
+            {selectedChunkedFiles.map((fileId) => {
+              const file = chunkedFiles.find(f => f.id === fileId);
+              return file ? (
+                <div key={fileId} className="flex items-center justify-between p-2 bg-gray-50 rounded hover:bg-gray-100 transition-colors duration-200">
+                  <div className="flex items-center space-x-2 min-w-0 flex-1">
+                    <div className="truncate">
+                      <span className="text-sm font-medium text-gray-900 truncate">{file.name}</span>
+                      <span className="text-xs text-gray-500 ml-2">(分块文件)</span>
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => handleChunkedFileDeselection(fileId)}
+                    className="ml-4 flex-shrink-0 text-red-500 hover:text-red-700"
+                  >
+                    移除
+                  </button>
+                </div>
+              ) : null;
+            })}
+          </div>
+        )}
+      </div>
+    );
+  };
+
   // 修改生成函数
   const handleGenerate = async () => {
-    if (!provider || !modelName) {
-      setStatus('请选择生成模型');
-      return;
-    }
-
-    if (!query) {
-      setStatus('请输入问题');
-      return;
-    }
-
-    if (generationMode === 'search' && searchResults.length === 0) {
-      setStatus('请确保有搜索结果');
-      return;
-    }
-
-    if (generationMode === 'collection' && !selectedCollection) {
-      setStatus('请选择集合');
-      return;
-    }
-
-    setIsGenerating(true);
-    setStatus('');
     try {
-      const requestBody = {
+      setIsGenerating(true);
+      setStatus('正在生成...');
+      setResponse('');
+
+      // 准备请求数据
+      const requestData = {
         provider,
         model_name: modelName,
         query,
-        api_key: apiKey || undefined,
+        api_key: apiKey,
         show_reasoning: showReasoning,
-        context_file_ids: selectedContextFiles,
-        context_contents: contextContents
+        ...(generationMode === 'search' && { search_results: searchResults }),
+        ...(generationMode === 'collection' && { collection_name: selectedCollection }),
+        ...(generationMode !== 'direct' && {
+          context_file_ids: selectedContextFiles,
+          chunked_file_ids: selectedChunkedFiles,
+          context_contents: contextContents,
+          additional_context: additionalContext
+        })
       };
-
-      // 根据生成方式添加不同的参数
-      if (generationMode === 'search') {
-        requestBody.search_results = searchResults;
-      } else {
-        requestBody.collection_name = selectedCollection;
-      }
-
-      // 添加详细的请求日志
-      console.log('Generation Mode:', generationMode);
-      console.log('Selected Collection:', selectedCollection);
-      console.log('Request Body:', JSON.stringify(requestBody, null, 2));
-
-      const response = await fetch(`${apiBaseUrl}/generate`, {
+      
+      console.log('生成请求数据:', requestData);
+      
+      // 使用 fetch 发送 POST 请求
+      const response = await fetch(`${apiBaseUrl}/generate/stream`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify(requestBody),
+        body: JSON.stringify(requestData)
       });
 
       if (!response.ok) {
-        const errorText = await response.text();
-        console.error('Error Response:', {
-          status: response.status,
-          statusText: response.statusText,
-          errorText: errorText
-        });
-        
-        let errorMessage;
-        try {
-          const errorData = JSON.parse(errorText);
-          errorMessage = errorData.detail || `生成失败: ${response.status} ${response.statusText}`;
-        } catch (e) {
-          errorMessage = `生成失败: ${response.status} ${response.statusText}`;
-        }
-        
-        throw new Error(errorMessage);
+        throw new Error(`HTTP error! status: ${response.status}`);
       }
 
-      const data = await response.json();
-      console.log('Success Response:', data);
-      
-      if (data.data && data.data.response) {
-        setResponse(data.data.response);
-        setStatus('生成完成！');
-      } else {
-        console.error('Unexpected response format:', data);
-        setStatus('生成完成，但返回格式不正确');
+      // 获取响应的 reader
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let responseText = '';
+
+      // 读取流式响应
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        // 解码并处理数据
+        const chunk = decoder.decode(value);
+        const lines = chunk.split('\n');
+        
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(line.slice(6));
+              if (data.type === 'content') {
+                responseText += data.content;
+                setResponse(responseText);
+              } else if (data.type === 'status') {
+                setStatus(data.status);
+              } else if (data.type === 'error') {
+                throw new Error(data.error);
+              } else if (data.type === 'done') {
+                setIsGenerating(false);
+                setStatus('生成完成');
+              }
+            } catch (error) {
+              console.error('处理响应数据出错:', error);
+              setStatus(`生成失败: ${error.message}`);
+              setIsGenerating(false);
+            }
+          }
+        }
       }
+      
     } catch (error) {
-      console.error('Generation error:', error);
-      setStatus(error.message || '生成失败');
-    } finally {
+      console.error('生成错误:', error);
+      setStatus(`生成失败: ${error.message}`);
+      setResponse('');
       setIsGenerating(false);
     }
   };
 
-  // 在文件管理对话框打开时刷新文件列表
-  useEffect(() => {
-    if (showFileManager) {
-      fetchFileList();
-    }
-  }, [showFileManager]);
-
   return (
     <div className="p-6">
       <h2 className="text-2xl font-bold mb-6">Generation</h2>
-      
       <div className="grid grid-cols-12 gap-6">
         {/* Left Panel - Generation Controls */}
         <div className="col-span-4 space-y-4">
@@ -479,6 +824,16 @@ const Generation = () => {
                       className="form-radio"
                     />
                     <span className="ml-2">直接从集合生成</span>
+                  </label>
+                  <label className="inline-flex items-center">
+                    <input
+                      type="radio"
+                      value="direct"
+                      checked={generationMode === 'direct'}
+                      onChange={(e) => setGenerationMode(e.target.value)}
+                      className="form-radio"
+                    />
+                    <span className="ml-2">直接生成（不使用上下文）</span>
                   </label>
                 </div>
               </div>
@@ -593,33 +948,6 @@ const Generation = () => {
                 </div>
               )}
 
-              {/* 上下文文件选择 */}
-              <div>
-                <label className="block text-sm font-medium mb-1">选择上下文文件</label>
-                <div className="max-h-[200px] overflow-y-auto border rounded p-2">
-                  {fileList.map(file => (
-                    <div key={file.file_id} className="flex items-center space-x-2 py-1">
-                      <input
-                        type="checkbox"
-                        id={`file-${file.file_id}`}
-                        checked={selectedContextFiles.includes(file.file_id)}
-                        onChange={async (e) => {
-                          if (e.target.checked) {
-                            await handleFileSelection(file.file_id);
-                          } else {
-                            handleFileDeselection(file.file_id);
-                          }
-                        }}
-                        className="rounded border-gray-300 text-green-500 focus:ring-green-500"
-                      />
-                      <label htmlFor={`file-${file.file_id}`} className="text-sm">
-                        {file.name}
-                      </label>
-                    </div>
-                  ))}
-                </div>
-              </div>
-
               {/* 显示请求命令的开关 */}
               <div className="flex items-center space-x-2">
                 <input
@@ -634,143 +962,23 @@ const Generation = () => {
                 </label>
               </div>
 
-              {/* 补充上下文区域 */}
-              <div className="mb-6">
-                {/* 文件上传区域 */}
-                <div className="bg-white rounded-lg shadow-sm border border-gray-100">
-                  {/* 标题栏 */}
-                  <div className="px-6 py-4 border-b border-gray-100 bg-gray-50">
-                    <h3 className="text-lg font-medium text-gray-800">补充上下文</h3>
-                    <p className="mt-1 text-sm text-gray-500">上传文件以提供额外的上下文信息</p>
+              {/* 补充上下文区域（仅当选择从搜索结果或集合生成时显示） */}
+              {generationMode !== 'direct' && (
+                <div className="mb-4">
+                  <div className="flex items-center justify-between mb-2">
+                    <label className="block text-sm font-medium text-gray-700">补充上下文</label>
                   </div>
-
-                  {/* 上传按钮和文件格式说明 */}
-                  <div className="px-6 py-4 bg-white">
-                    <div className="flex items-center justify-between">
-                      <div className="flex-1">
-                        <input
-                          type="file"
-                          multiple
-                          onChange={handleFileUpload}
-                          className="hidden"
-                          id="context-files"
-                          accept={Object.values(SUPPORTED_FILE_TYPES).flat().join(',')}
-                        />
-                        <label
-                          htmlFor="context-files"
-                          className="inline-flex items-center px-4 py-2 border border-indigo-200 shadow-sm text-sm font-medium rounded-md text-indigo-700 bg-indigo-50 hover:bg-indigo-100 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-colors duration-200"
-                        >
-                          <svg className="w-5 h-5 mr-2 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 4v16m8-8H4" />
-                          </svg>
-                          选择文件
-                        </label>
-                        <span className="ml-3 text-sm text-gray-500">
-                          支持多种文件格式
-                        </span>
-                      </div>
-                    </div>
-
-                    {/* 文件格式说明 */}
-                    <div className="mt-4 grid grid-cols-2 gap-4">
-                      <div className="text-sm p-3 bg-gray-50 rounded-md border border-gray-100">
-                        <p className="font-medium text-gray-800">文本文件</p>
-                        <p className="text-gray-500">.txt, .md, .json, .csv, .log</p>
-                      </div>
-                      <div className="text-sm p-3 bg-gray-50 rounded-md border border-gray-100">
-                        <p className="font-medium text-gray-800">芯片设计</p>
-                        <p className="text-gray-500">.v, .sv, .lef, .lib, .def, .sdc, .spef, .gds</p>
-                      </div>
-                      <div className="text-sm p-3 bg-gray-50 rounded-md border border-gray-100">
-                        <p className="font-medium text-gray-800">文档文件</p>
-                        <p className="text-gray-500">.pdf, .doc, .docx, .xls, .xlsx</p>
-                      </div>
-                      <div className="text-sm p-3 bg-gray-50 rounded-md border border-gray-100">
-                        <p className="font-medium text-gray-800">配置文件</p>
-                        <p className="text-gray-500">.yaml, .yml, .xml, .ini, .conf</p>
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* 已上传文件列表 */}
-                  {uploadedFiles.length > 0 && (
-                    <div className="px-6 py-4 border-t border-gray-100 bg-gray-50">
-                      <h4 className="text-sm font-medium text-gray-800 mb-3">已上传文件</h4>
-                      <div className="space-y-2">
-                        {uploadedFiles.map((file, index) => {
-                          console.log('渲染文件:', file);
-                          return (
-                            <div 
-                              key={`${file.id}-${index}`}
-                              className={`flex items-center justify-between py-2 px-3 bg-white rounded-md border ${
-                                file.status === FILE_STATUS.ERROR ? 'border-red-200' :
-                                file.status === FILE_STATUS.SUCCESS ? 'border-green-200' :
-                                'border-gray-100'
-                              } shadow-sm transition-all duration-200`}
-                            >
-                              <div className="flex items-center min-w-0">
-                                <div className="flex-shrink-0">
-                                  {file.status === FILE_STATUS.UPLOADING && (
-                                    <div className="w-5 h-5">
-                                      <svg className="animate-spin h-5 w-5 text-indigo-500" fill="none" viewBox="0 0 24 24">
-                                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                                      </svg>
-                                    </div>
-                                  )}
-                                  {file.status === FILE_STATUS.SUCCESS && (
-                                    <svg className="h-5 w-5 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7" />
-                                    </svg>
-                                  )}
-                                  {file.status === FILE_STATUS.ERROR && (
-                                    <svg className="h-5 w-5 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
-                                    </svg>
-                                  )}
-                                </div>
-                                <div className="ml-3 min-w-0">
-                                  <p className="text-sm font-medium text-gray-800 truncate">{file.name}</p>
-                                  <p className="text-xs text-gray-500">
-                                    {Math.round(file.size / 1024)} KB • {new Date(file.uploadTime).toLocaleString()}
-                                  </p>
-                                  {file.status === FILE_STATUS.ERROR && (
-                                    <p className="text-xs text-red-500 mt-1">{file.error}</p>
-                                  )}
-                                  {file.status === FILE_STATUS.UPLOADING && (
-                                    <p className="text-xs text-indigo-500 mt-1">正在处理...</p>
-                                  )}
-                                  {file.status === FILE_STATUS.SUCCESS && (
-                                    <p className="text-xs text-green-500 mt-1">处理成功</p>
-                                  )}
-                                </div>
-                              </div>
-                              <button
-                                onClick={() => removeFile(file.id)}
-                                className="ml-4 flex-shrink-0 text-gray-400 hover:text-red-500 transition-colors duration-200"
-                              >
-                                <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
-                                </svg>
-                              </button>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* 上下文预览 */}
-                  {additionalContext && (
-                    <div className="px-6 py-4 border-t border-gray-100 bg-white">
-                      <h4 className="text-sm font-medium text-gray-800 mb-3">上下文预览</h4>
-                      <div className="bg-gray-50 rounded-md p-4 max-h-[200px] overflow-y-auto border border-gray-100">
-                        <pre className="text-sm text-gray-700 whitespace-pre-wrap font-mono">{additionalContext}</pre>
-                      </div>
-                    </div>
-                  )}
+                  <textarea
+                    value={additionalContext}
+                    onChange={(e) => setAdditionalContext(e.target.value)}
+                    className="w-full h-32 p-2 border rounded"
+                    placeholder="输入补充的上下文信息..."
+                  />
                 </div>
-              </div>
+              )}
+
+              {/* 文件选择区域（仅当选择从搜索结果或集合生成时显示） */}
+              {generationMode !== 'direct' && renderFileSelection()}
 
               {/* 显示请求命令 */}
               {showRequestCommand && (
@@ -782,9 +990,14 @@ const Generation = () => {
                       model_name: modelName,
                       query,
                       show_reasoning: showReasoning,
-                      context_file_ids: selectedContextFiles,
-                      context_contents: contextContents.filter(content => content !== null),  // 过滤掉null值
-                      ...(generationMode === 'search' ? { search_results: searchResults } : { collection_name: selectedCollection })
+                      generation_mode: generationMode,
+                      ...(generationMode === 'search' && { search_results: searchResults }),
+                      ...(generationMode === 'collection' && { collection_name: selectedCollection }),
+                      ...(generationMode !== 'direct' && {
+                        context_file_ids: selectedContextFiles,
+                        context_contents: contextContents.filter(content => content !== null),
+                        additional_context: additionalContext
+                      })
                     }, null, 2)}
                   </pre>
                 </div>
@@ -792,11 +1005,18 @@ const Generation = () => {
 
               <button
                 onClick={handleGenerate}
-                disabled={isGenerating}
+                disabled={isGenerating || !provider || !modelName}
                 className="w-full px-4 py-2 bg-green-500 text-white rounded hover:bg-green-600 disabled:bg-green-300"
               >
                 {isGenerating ? 'Generating...' : 'Generate'}
               </button>
+              {/* 未选择模型时的提示 */}
+              {(!provider || !modelName) && (
+                <div className="mt-2 p-2 bg-yellow-50 text-yellow-700 rounded text-sm flex items-center">
+                  <svg className="h-4 w-4 mr-1 text-yellow-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v4m0 4h.01M21 12c0 4.97-4.03 9-9 9s-9-4.03-9-9 4.03-9 9-9 9 4.03 9 9z" /></svg>
+                  请先选择模型提供商和模型
+                </div>
+              )}
 
               {status && (
                 <div className={`p-4 rounded-lg ${
@@ -816,92 +1036,20 @@ const Generation = () => {
               <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-green-500 mb-4"></div>
               <p className="text-gray-600">正在生成回答...</p>
             </div>
-          ) : generationMode === 'search' ? (
-            selectedFile ? (
-              <>
-                {/* Search Results Context */}
-                <div className="mb-6 p-4 border rounded-lg bg-white shadow-sm hover:shadow-md transition-shadow duration-200">
-                  <h3 className="text-xl font-semibold mb-4 text-gray-800">Search Context</h3>
-                  <div className="space-y-4 max-h-[300px] overflow-y-auto custom-scrollbar">
-                    {searchResults.map((result, idx) => (
-                      <div key={idx} className="p-4 border rounded bg-gray-50 hover:bg-gray-100 transition-colors duration-200">
-                        <div className="flex justify-between items-start mb-2">
-                          <span className="font-medium text-sm text-gray-500">
-                            相似度: {(result.score * 100).toFixed(1)}%
-                          </span>
-                          <div className="text-sm text-gray-500">
-                            <div>文档: {result.metadata?.document_name || 'N/A'}</div>
-                            <div>页码: {result.metadata?.page_number || 'N/A'}</div>
-                            <div>块号: {result.metadata?.chunk_id || 'N/A'}</div>
-                          </div>
-                        </div>
-                        <p className="text-sm whitespace-pre-wrap text-gray-700">{result.content}</p>
-                      </div>
-                    ))}
-                    {searchResults.length === 0 && (
-                      <div className="text-gray-500 text-center py-4">
-                        No search results available. Please perform a search first.
-                      </div>
-                    )}
-                  </div>
-                </div>
-
-                {/* Generated Response */}
-                {response && (
-                  <div className="p-4 border rounded-lg bg-white shadow-sm hover:shadow-md transition-shadow duration-200">
-                    <h3 className="text-xl font-semibold mb-4 text-gray-800">Generated Response</h3>
-                    <div className="p-4 border rounded bg-gray-50">
-                      <p className="whitespace-pre-wrap text-gray-700 leading-relaxed">{response}</p>
-                    </div>
-                  </div>
-                )}
-              </>
-            ) : (
-              <div className="flex flex-col items-center justify-center h-[400px] bg-white rounded-lg shadow-sm">
-                <RandomImage message="Select a search results file to start generation" />
+          ) : response ? (
+            <div className="p-4 border rounded-lg bg-white shadow-sm hover:shadow-md transition-shadow duration-200">
+              <h3 className="text-xl font-semibold mb-4 text-gray-800">Generated Response</h3>
+              <div className="p-4 border rounded bg-gray-50">
+                <p className="whitespace-pre-wrap text-gray-700 leading-relaxed">{response}</p>
               </div>
-            )
+            </div>
           ) : (
-            <>
-              {/* Collection Generation Response */}
-              {response ? (
-                <div className="p-4 border rounded-lg bg-white shadow-sm hover:shadow-md transition-shadow duration-200">
-                  <h3 className="text-xl font-semibold mb-4 text-gray-800">Generated Response</h3>
-                  <div className="p-4 border rounded bg-gray-50">
-                    <p className="whitespace-pre-wrap text-gray-700 leading-relaxed">{response}</p>
-                  </div>
-                </div>
-              ) : (
-                <div className="flex flex-col items-center justify-center h-[400px] bg-white rounded-lg shadow-sm">
-                  <RandomImage message="Enter your question and select a collection to start generation" />
-                </div>
-              )}
-            </>
+            <div className="flex flex-col items-center justify-center h-[400px] bg-white rounded-lg shadow-sm">
+              <RandomImage message="Enter your question and click Generate to start" />
+            </div>
           )}
         </div>
       </div>
-
-      {/* 添加自定义滚动条样式 */}
-      <style jsx>{`
-        .custom-scrollbar::-webkit-scrollbar {
-          width: 6px;
-          height: 6px;
-        }
-        .custom-scrollbar::-webkit-scrollbar-track {
-          background: #f8fafc;
-          border-radius: 3px;
-        }
-        .custom-scrollbar::-webkit-scrollbar-thumb {
-          background: #cbd5e1;
-          border-radius: 3px;
-        }
-        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-          background: #94a3b8;
-        }
-        .custom-scrollbar::-webkit-scrollbar-corner {
-          background: #f8fafc;
-        }
-      `}</style>
 
       {/* 文件管理按钮 */}
       <button
@@ -915,67 +1063,10 @@ const Generation = () => {
       </button>
 
       {/* 文件管理对话框 */}
-      {showFileManager && (
-        <div className="fixed inset-0 bg-gray-500 bg-opacity-75 flex items-center justify-center">
-          <div className="bg-white rounded-lg p-6 max-w-4xl w-full max-h-[80vh] overflow-y-auto">
-            <div className="flex justify-between items-center mb-4">
-              <h3 className="text-lg font-medium text-gray-900">文件管理</h3>
-              <div className="flex space-x-2">
-                <button
-                  onClick={fetchFileList}
-                  className="px-3 py-1 text-sm text-blue-600 hover:text-blue-800"
-                >
-                  刷新列表
-                </button>
-                <button
-                  onClick={() => setShowFileManager(false)}
-                  className="text-gray-400 hover:text-gray-500"
-                >
-                  <svg className="h-6 w-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
-                  </svg>
-                </button>
-              </div>
-            </div>
-            
-            <div className="space-y-4">
-              {fileList.map(file => (
-                <div
-                  key={file.file_id}
-                  className="flex items-center justify-between p-4 bg-gray-50 rounded-lg"
-                >
-                  <div className="flex items-center space-x-4">
-                    <div className="flex-shrink-0">
-                      <svg className="h-8 w-8 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                      </svg>
-                    </div>
-                    <div>
-                      <p className="text-sm font-medium text-gray-900">{file.name}</p>
-                      <p className="text-xs text-gray-500">
-                        {Math.round(file.size / 1024)} KB • {new Date(file.upload_time).toLocaleString()}
-                      </p>
-                      <p className="text-xs text-gray-500">
-                        使用次数: {file.used_count} • 状态: {file.status}
-                      </p>
-                    </div>
-                  </div>
-                  <div className="flex items-center space-x-2">
-                    <button
-                      onClick={() => removeFile(file.file_id)}
-                      className="text-red-600 hover:text-red-800"
-                    >
-                      <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                      </svg>
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-      )}
+      {renderFileManager()}
+      
+      {/* 分块文件管理对话框 */}
+      {renderChunkedFileManager()}
     </div>
   );
 };

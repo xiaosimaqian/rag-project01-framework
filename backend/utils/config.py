@@ -58,7 +58,7 @@ MILVUS_LITE_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "mil
 MILVUS_CONFIG = {
     "host": "localhost",  # 或者使用环境变量
     "port": 19530,       # 或者使用环境变量
-    "uri": MILVUS_LITE_FILE,
+    "uri": MILVUS_LITE_FILE,  # 使用 Milvus Lite 本地文件
     "index_types": {
         "flat": "FLAT",
         "ivf_flat": "IVF_FLAT",
@@ -96,4 +96,25 @@ CHROMA_CONFIG = {
             "search_ef": 10
         }
     }
+} 
+
+OLLAMA_CONFIG = {
+    "base_url": "http://localhost:11434",  # Ollama 服务器的基础 URL
+    "model_name": "llama3",  # 默认使用的 Ollama 模型
+    "request_timeout": 120.0, # 请求超时时间 (秒)
+    # "headers": {
+    #     "Authorization": "Bearer YOUR_API_KEY" # 如果您的 Ollama 实例需要认证
+    # }
+} 
+
+MILVUS_LITE_CONFIG = {
+    "host": "",
+    "port": "",
+    "uri": MILVUS_LITE_FILE
+}
+
+MILVUS_STANDALONE_CONFIG = {
+    "host": "localhost",
+    "port": 19530,
+    "uri": "tcp://localhost:19530"
 } 
