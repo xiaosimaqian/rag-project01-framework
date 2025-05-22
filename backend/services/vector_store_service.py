@@ -766,10 +766,23 @@ class VectorStoreService:
             collection = Collection(name=collection_name, schema=schema, using=self.milvus_alias)
             logger.info(f"[_index_embeddings_milvus_lite] 成功创建集合: {collection_name}")
 
+            # 创建索引
+            index_type = config.index_mode or "FLAT"
+            metric_type = "L2"
+            params = {}
+            
+            # 自动设置 nlist
+            if index_type.upper() in ["IVF_FLAT", "IVF_SQ8", "IVF_PQ"]:
+                n_vectors = len(vectors)
+                nlist = min(2048, max(1, n_vectors // 8))
+                nlist = max(1, min(nlist, 65536))
+                params["nlist"] = nlist
+                logger.info(f"[_index_embeddings_milvus_lite] 自动设置 nlist={nlist} (向量数量={n_vectors})")
+
             index_params = {
-                "index_type": config.index_mode or "FLAT",
-                "metric_type": "L2",
-                "params": {}
+                "index_type": index_type,
+                "metric_type": metric_type,
+                "params": params
             }
             collection.create_index(field_name="vector", index_params=index_params)
             logger.info(f"[_index_embeddings_milvus_lite] 成功创建索引: {index_params}")
@@ -890,17 +903,63 @@ class VectorStoreService:
 
             # 检查集合是否存在，使用别名
             if utility.has_collection(collection_name, using=self.milvus_alias):
-                utility.drop_collection(collection_name, using=self.milvus_alias)
-                logger.info(f"[_index_embeddings_milvus_standalone] 已删除已存在的集合: {collection_name}")
+                if config.rebuild_index:
+                    # 如果需要重建索引，则删除已存在的集合
+                    utility.drop_collection(collection_name, using=self.milvus_alias)
+                    logger.info(f"[_index_embeddings_milvus_standalone] 已删除已存在的集合: {collection_name}")
+                else:
+                    # 追加模式：获取已存在的集合
+                    collection = Collection(name=collection_name, using=self.milvus_alias)
+                    collection.load()
+                    logger.info(f"[_index_embeddings_milvus_standalone] 使用已存在的集合: {collection_name}")
+                    
+                    # 构造正确的插入数据格式
+                    insert_data = [{"vector": vector} for vector in vectors]
+                    logger.info(f"[_index_embeddings_milvus_standalone] 开始追加向量，数量: {len(vectors)}，连接别名: {self.milvus_alias}")
+                    collection.insert(insert_data)
+                    logger.info(f"[_index_embeddings_milvus_standalone] 成功追加 {len(vectors)} 个向量")
+                    
+                    # 更新元数据
+                    metadata = self._get_collection_metadata(collection_name, config.provider)
+                    metadata["total_vectors"] = metadata.get("total_vectors", 0) + len(vectors)
+                    self._save_collection_metadata(collection_name, metadata, config.provider)
+                    
+                    return {
+                        "status": "success",
+                        "message": f"成功追加 {len(vectors)} 个向量到集合 {collection_name}",
+                        "provider": config.provider,
+                        "count": len(vectors),
+                        "total_vectors": metadata["total_vectors"],
+                        "details": {
+                            "collection_name": collection_name,
+                            "vector_count": len(vectors),
+                            "dimension": dimension,
+                            "index_type": metadata.get("index_type", "FLAT"),
+                            "provider": config.provider
+                        }
+                    }
 
             # 创建集合，指定 using
             collection = Collection(name=collection_name, schema=schema, using=self.milvus_alias)
             logger.info(f"[_index_embeddings_milvus_standalone] 成功创建集合: {collection_name}")
 
+            # 创建索引
+            index_type = config.index_mode or "FLAT"
+            metric_type = "L2"
+            params = {}
+            
+            # 自动设置 nlist
+            if index_type.upper() in ["IVF_FLAT", "IVF_SQ8", "IVF_PQ"]:
+                n_vectors = len(vectors)
+                nlist = min(2048, max(1, n_vectors // 8))
+                nlist = max(1, min(nlist, 65536))
+                params["nlist"] = nlist
+                logger.info(f"[_index_embeddings_milvus_standalone] 自动设置 nlist={nlist} (向量数量={n_vectors})")
+
             index_params = {
-                "index_type": config.index_mode or "FLAT",
-                "metric_type": "L2",
-                "params": {}
+                "index_type": index_type,
+                "metric_type": metric_type,
+                "params": params
             }
             collection.create_index(field_name="vector", index_params=index_params)
             logger.info(f"[_index_embeddings_milvus_standalone] 成功创建索引: {index_params}")

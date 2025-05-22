@@ -42,13 +42,11 @@ const Indexing = () => {
       { value: 'HNSW', label: 'HNSW' },
     ],
     milvus_standalone: [
-      { value: 'FLAT', label: 'FLAT' },
       { value: 'IVF_FLAT', label: 'IVF_FLAT' },
       { value: 'IVF_SQ8', label: 'IVF_SQ8' },
       { value: 'IVF_PQ', label: 'IVF_PQ' },
       { value: 'HNSW', label: 'HNSW' },
-      { value: 'BIN_FLAT', label: 'BIN_FLAT' },
-      { value: 'BIN_IVF_FLAT', label: 'BIN_IVF_FLAT' },
+      { value: 'DISKANN', label: 'DISKANN' },
     ],
     chroma: [
       // ...chroma 支持的索引类型
